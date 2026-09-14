@@ -469,7 +469,23 @@ class DiffTabComponent(
         val editable = buffer != null
 
         if (editable && absolutePath != null) {
-            SaveOnCommandS(state, absolutePath, onNote) { content(state, true) }
+            val editableBuffer = buffer ?: return
+            Column(modifier = Modifier.fillMaxSize()) {
+                ExternalChangeBar(
+                    buffer = editableBuffer,
+                    onReload = {
+                        ExternalChangeWatcher.current()?.resolveByReloading(editableBuffer)
+                        onNote(null)
+                    },
+                    onKeepMine = {
+                        ExternalChangeWatcher.current()?.resolveByKeepingMine(editableBuffer)
+                        onNote(null)
+                    },
+                )
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    SaveOnCommandS(state, absolutePath, onNote) { content(state, true) }
+                }
+            }
         } else {
             content(state, false)
         }

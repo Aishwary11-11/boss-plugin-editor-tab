@@ -199,6 +199,38 @@ class EditorDocumentSaveTest {
             }
         }
 
+    @Test
+    fun `keep mine permits retry while reload preserves external content`() =
+        runBlocking {
+            withFile { file ->
+                for (keepMine in listOf(true, false)) {
+                    file.writeText("original")
+                    val buffer = buffer(file)
+                    val edited = buffer.content
+                    val watcher = ExternalChangeWatcher(this)
+                    file.writeText("external change")
+                    assertEquals(DocumentSaveResult.CONFLICT, saveEditorDocument(buffer, ::commit))
+                    if (keepMine) {
+                        watcher.resolveByKeepingMine(buffer)
+                        assertTrue(buffer.editorState.isModified.value)
+                        assertEquals(DocumentSaveResult.SAVED, saveEditorDocument(buffer, ::commit))
+                        assertEquals(edited, file.readText())
+                    } else {
+                        watcher.resolveByReloading(buffer)
+                        assertEquals("external change", buffer.content)
+                        assertEquals(
+                            DocumentSaveResult.UNCHANGED,
+                            saveEditorDocument(buffer) { _, _ -> error("reload must not write") },
+                        )
+                        assertEquals("external change", file.readText())
+                    }
+                    assertEquals(ExternalState.IN_SYNC, buffer.externalState.value)
+                    assertFalse(buffer.editorState.isModified.value)
+                    assertEquals(signatureOf(file), buffer.knownSignature)
+                }
+            }
+        }
+
     private fun commit(
         path: String,
         text: String,
