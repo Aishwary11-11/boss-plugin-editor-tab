@@ -8,7 +8,7 @@ Code editor tab with syntax highlighting, code folding, and run gutter icons
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.editortab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin`
-- **API Version**: pinned in `build.gradle.kts` (currently `boss-plugin-api-1.0.80.jar`); the floor moves whenever the plugin uses a newer surface
+- **API Version**: pinned in `build.gradle.kts` (currently `boss-plugin-api-1.0.87.jar`); the floor moves whenever the plugin uses a newer surface
 
 ## Essential Commands
 
@@ -57,6 +57,7 @@ build.gradle.kts   → Build config + version (single source of truth)
 
 ### Dependencies
 - **boss-plugin-api**: compileOnly (provided by host app at runtime)
+- **bosseditor-compose-desktop**: bundled privately; 1.0.13 provides multiline inline AI suggestions and the LSP startup fixes used here
 - **Compose Desktop**: UI framework
 - **Decompose**: Navigation and component lifecycle
 - **Coroutines**: Async operations

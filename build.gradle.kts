@@ -27,7 +27,9 @@ group = "ai.rever.boss.plugin.dynamic"
 // implemented over one shared buffer per path, "Open Diff" context-menu entry
 // (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
-version = "1.6.2"
+// 1.6.3: auto-bumped bundled BossEditor to 1.0.13
+// (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.13).
+version = "1.6.5"
 
 java {
     toolchain {
@@ -66,7 +68,7 @@ dependencies {
     // BossEditor is private to this plugin (bundled into the plugin JAR by
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.12")
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.13")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,

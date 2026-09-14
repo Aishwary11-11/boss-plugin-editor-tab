@@ -1,13 +1,15 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
-import ai.rever.boss.plugin.api.AiAvailability
 import ai.rever.boss.plugin.api.AiGatewayAPI
+import ai.rever.boss.plugin.api.AiChunk
 import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.bosseditor.core.EditorPosition
+import ai.rever.bosseditor.core.EditorDocument
 import ai.rever.bosseditor.core.EditorState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -15,6 +17,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -25,8 +28,12 @@ import java.io.File
 // ========== Settings ==========
 
 /**
- * AI tab-completion settings, own file: ~/.boss/editor-settings.json is the
+ * AI tab-completion settings live in their own file; ~/.boss/editor-settings.json is the
  * BossEditor library's format and adding keys to it is not ours to do.
+ *
+ * Older files may still contain `model`; `Json.ignoreUnknownKeys` deliberately ignores it.
+ * Model selection is now owned by AI Gateway, so completion follows the same active model as
+ * every other editor AI surface instead of carrying a second, silently divergent override.
  */
 @Serializable
 data class AiCompletionSettingsData(
@@ -34,7 +41,8 @@ data class AiCompletionSettingsData(
     /**
      * How long the typing has to stop before a request goes out.
      *
-     * 300ms suits a provider that answers in a few hundred ms. The CLI route
+     * 1200ms keeps the editor responsive without issuing a request for every
+     * keystroke. The CLI route
      * measured 11.7-15.9s on a realistic 4KB completion prompt, and a request
      * abandoned by the next keystroke still runs to completion - cancelling the
      * coroutine cannot interrupt the blocking read, and it kills the watchdog
@@ -51,13 +59,11 @@ data class AiCompletionSettingsData(
      * that route. Set above the measured worst case with margin.
      */
     val timeoutMs: Long = 20_000,
-    val maxTokens: Int = 256,
+    val maxTokens: Int = 96,
     /** Context sent before the caret. */
-    val maxPrefixChars: Int = 6_000,
+    val maxPrefixChars: Int = 1_600,
     /** Context sent after the caret. */
-    val maxSuffixChars: Int = 2_000,
-    /** Optional fast-model hint, forwarded as AiRequest.extras["model"]. */
-    val model: String = "",
+    val maxSuffixChars: Int = 400,
 )
 
 /** Reactive settings from ~/.boss/ai-completion-settings.json (PluginEditorSettings pattern). */
@@ -137,10 +143,9 @@ data class CompletionContext(
 /**
  * AI tab completion (ghost text), plugin-side.
  *
- * The bundled BossEditor has no inline-suggestion mechanism, so the suggestion
- * renders as an overlay in [EditorTabComponent] and Tab/Esc are intercepted
- * before the editor sees them (preview phase — the editor consumes Tab for
- * indent). The AI comes from the ai-gateway plugin's [AiGatewayAPI], resolved
+ * BossEditor renders the suggestion at the caret and reserves virtual lines for multiline
+ * continuations. Tab/Esc are intercepted before the editor sees them (preview phase — the editor
+ * consumes Tab for indent). The AI comes from the ai-gateway plugin's [AiGatewayAPI], resolved
  * lazily per request (load order across plugins is not guaranteed, so caching
  * a null at construction would disable the feature forever); every failure —
  * gateway absent, no provider, timeout, blank reply — is silence, never an
@@ -189,42 +194,46 @@ class AiTabCompletionService(
             _unavailable.value = null
             return
         }
-        val readiness = AiAvailability.check(context)
-        _unavailable.value =
-            AiInlineEditService.describeReadiness(readiness) ?: slowProviderNotice(timeouts)
-        if (readiness != AiReadiness.READY) return
-        val gateway = context.getPluginAPI(AiGatewayAPI::class.java) ?: return
         inFlight = scope.launch {
             delay(settings.debounceMs)
+            val gateway = awaitEditorAiGateway(context)
+            if (gateway == null) {
+                _unavailable.value = AiInlineEditService.describeReadiness(editorAiReadiness(context))
+                return@launch
+            }
+            _unavailable.value = slowProviderNotice(timeouts)
             if (editorState.multiCaretModel.hasMultipleCarets) return@launch
             val document = editorState.document
             val version = document.documentVersion
             val caret = editorState.caretPosition.value
             val completionContext =
                 buildContext(document.getText(), editorState.caretOffset, language, filePath, settings)
-            val reply = withContext(Dispatchers.IO) {
-                // The gateway is documented to honor timeoutMs; the outer bound
-                // keeps a gateway bug from ever hanging this coroutine.
-                withTimeoutOrNull(settings.timeoutMs + 500) {
-                    gateway.complete(buildRequest(completionContext, settings))
+            val outcome = withContext(Dispatchers.IO) {
+                // Streaming lets useful text appear as soon as the model emits
+                // it instead of hiding the whole completion until generation
+                // finishes. Providers without native streaming are handled by
+                // the gateway's documented Text + Completed fallback.
+                collectCompletionStream(gateway, buildRequest(completionContext, settings), settings.timeoutMs + 500) {
+                    publishIfFresh(editorState, document, version, caret, completionContext, it)
                 }
             }
-            if (reply == null) {
-                // Out of budget. Count it: enough of these in a row and the
-                // provider is simply too slow for this feature, which is worth
-                // saying rather than retrying in silence forever.
-                timeouts++
-                _unavailable.value = slowProviderNotice(timeouts)
-                return@launch
+            when (outcome) {
+                CompletionStreamOutcome.Completed -> timeouts = 0
+                CompletionStreamOutcome.TimedOut -> {
+                    // A partial stream is not a completion: leaving it visible lets Tab insert
+                    // truncated code. Clear it before reporting a repeatedly slow provider.
+                    _suggestion.value = null
+                    timeouts++
+                    _unavailable.value = slowProviderNotice(timeouts)
+                }
+                CompletionStreamOutcome.Incomplete -> _suggestion.value = null
+                is CompletionStreamOutcome.Failed -> {
+                    _suggestion.value = null
+                    System.err.println(
+                        "[AiTabCompletion] ${outcome.error::class.simpleName}: ${outcome.error.message}",
+                    )
+                }
             }
-            timeouts = 0
-            val replyValue = reply.getOrNull() ?: return@launch
-            val completion = postProcess(replyValue.text, completionContext) ?: return@launch
-            // Stale guard: the user kept typing or moved the caret while the
-            // request flew. MVP stand-in for the D3 document-version guard
-            // (IDE-FEATURES-SCOPE.md).
-            if (document.documentVersion != version || editorState.caretPosition.value != caret) return@launch
-            _suggestion.value = GhostSuggestion(completion, caret, version)
         }
     }
 
@@ -249,6 +258,7 @@ class AiTabCompletionService(
      */
     fun accept(editorState: EditorState): Boolean {
         val shown = _suggestion.value ?: return false
+        inFlight?.cancel()
         _suggestion.value = null
         if (editorState.document.documentVersion != shown.documentVersion ||
             editorState.caretPosition.value != shown.position
@@ -257,6 +267,21 @@ class AiTabCompletionService(
         }
         editorState.insertText(shown.text)
         return true
+    }
+
+    private fun publishIfFresh(
+        editorState: EditorState,
+        document: EditorDocument,
+        version: Long,
+        caret: EditorPosition,
+        completionContext: CompletionContext,
+        raw: String,
+    ) {
+        val completion = postProcess(raw, completionContext) ?: return
+        // The user may keep typing while tokens arrive. Never let an older
+        // stream overwrite the text at a new caret/document version.
+        if (document.documentVersion != version || editorState.caretPosition.value != caret) return
+        _suggestion.value = GhostSuggestion(completion, caret, version)
     }
 
     companion object {
@@ -321,10 +346,12 @@ class AiTabCompletionService(
                             "Output only the completion to insert at the cursor.",
                     ),
                 ),
-                temperature = 0f,
                 maxTokens = settings.maxTokens,
                 timeoutMs = settings.timeoutMs,
-                extras = if (settings.model.isBlank()) emptyMap() else mapOf("model" to settings.model),
+                temperature = 0f,
+                // The absent override makes the gateway use the shared provider's
+                // active/default model and its secret-manager-backed credential.
+                extras = emptyMap(),
             )
 
         /** Cleans a raw model reply; null means "show nothing". */
@@ -355,4 +382,51 @@ class AiTabCompletionService(
             return if (lines.size > MAX_LINES) lines.take(MAX_LINES).joinToString("\n") else text
         }
     }
+}
+
+/** Terminal state of one completion stream. Only [Completed] may remain accept-able. */
+internal sealed interface CompletionStreamOutcome {
+    data object Completed : CompletionStreamOutcome
+    data object TimedOut : CompletionStreamOutcome
+    data object Incomplete : CompletionStreamOutcome
+    data class Failed(val error: Throwable) : CompletionStreamOutcome
+}
+
+/** Collect one gateway stream, publishing partial text while requiring an explicit completion. */
+internal suspend fun collectCompletionStream(
+    gateway: AiGatewayAPI,
+    request: AiRequest,
+    timeoutMs: Long,
+    publish: (String) -> Unit,
+): CompletionStreamOutcome {
+    val streamed = StringBuilder()
+    return withTimeoutOrNull(timeoutMs) {
+        var outcome: CompletionStreamOutcome = CompletionStreamOutcome.Incomplete
+        try {
+            gateway.stream(request).takeWhile { chunk ->
+                when (chunk) {
+                    is AiChunk.Text -> {
+                        streamed.append(chunk.text)
+                        publish(streamed.toString())
+                        true
+                    }
+                    is AiChunk.Completed -> {
+                        publish(chunk.reply.text.ifBlank { streamed.toString() })
+                        outcome = CompletionStreamOutcome.Completed
+                        false
+                    }
+                    is AiChunk.Failed -> {
+                        outcome = CompletionStreamOutcome.Failed(chunk.error)
+                        false
+                    }
+                    else -> true
+                }
+            }.collect {}
+            outcome
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Exception) {
+            CompletionStreamOutcome.Failed(error)
+        }
+    } ?: CompletionStreamOutcome.TimedOut
 }

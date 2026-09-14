@@ -46,8 +46,8 @@ class ComposerAgent(
     // removes its own entry from the run's IO coroutine.
     private val runs = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
-    /** @return null when no AI gateway is registered. */
-    fun gateway(): AiGatewayAPI? = context.getPluginAPI(AiGatewayAPI::class.java)
+    /** @return the current ready gateway, including a selected Claude/Codex CLI engine. */
+    fun gateway(): AiGatewayAPI? = resolveReadyEditorAiGateway(context)
 
     /**
      * The focused editor's selection, or null when nothing is selected.

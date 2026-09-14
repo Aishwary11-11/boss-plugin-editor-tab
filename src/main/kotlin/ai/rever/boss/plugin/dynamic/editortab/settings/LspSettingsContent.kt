@@ -10,10 +10,10 @@ import ai.rever.boss.plugin.ui.BossDarkSuccess
 import ai.rever.boss.plugin.ui.BossDarkSurface
 import ai.rever.boss.plugin.ui.BossDarkTextMuted
 import ai.rever.boss.plugin.ui.BossDarkTextPrimary
+import ai.rever.boss.plugin.dynamic.editortab.LspNavigation
 import ai.rever.bosseditor.lsp.config.*
 import ai.rever.bosseditor.lsp.logging.LogLevel
 import ai.rever.bosseditor.lsp.server.LanguageServerRegistry
-import ai.rever.bosseditor.lsp.server.ServerDiscovery
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -342,14 +342,16 @@ private fun BuiltInServersSection(
     disabledServers: Set<String>,
     onToggleServer: (String, Boolean) -> Unit
 ) {
-    val serverDiscovery = remember { ServerDiscovery() }
     var serverAvailability by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             val availability = LanguageServerRegistry.getAllConfigs().associate { config ->
-                config.languageId to serverDiscovery.isCommandAvailable(config.command.first())
+                // Use the same recovered shell PATH and explicit-path rules as navigation.
+                // ServerDiscovery only sees the Dock-launched process PATH, which made a server
+                // show as "not installed" here while LspNavigation could launch it successfully.
+                config.languageId to (LspNavigation.shared.launchConfig(config) != null)
             }
             serverAvailability = availability
         }

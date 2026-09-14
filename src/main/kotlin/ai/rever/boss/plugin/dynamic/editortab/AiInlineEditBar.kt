@@ -29,11 +29,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
@@ -51,9 +54,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Cmd+K, Cursor's way: one compact card layered over the top of the editor,
- * carrying the whole interaction — prompt, generation, then an inline red/green
- * diff you accept or reject. Not a modal.
+ * Cmd/Ctrl+I or Cmd/Ctrl+K: one compact card layered over the top of the editor,
+ * carrying the prompt and compact review controls. The red/green review itself is rendered in
+ * the editor surface from a shadow document. Not a modal.
  *
  * It replaces two stacked Material dialogs (an `AlertDialog` for the prompt,
  * then the library's `RefactorPreviewDialog` for the result), which took focus
@@ -77,6 +80,7 @@ fun AiInlineEditBar(
 ) {
     val reviewing = session.done && session.replacement.isNotEmpty()
     val focus = remember { FocusRequester() }
+    var promptReceivedFocus by remember { mutableStateOf(false) }
 
     LaunchedEffect(reviewing) {
         if (!reviewing) {
@@ -86,7 +90,9 @@ fun AiInlineEditBar(
 
     Column(
         modifier = modifier
-            .fillMaxWidth()
+            // A compact anchored card on wide editors; Compose constrains this width to the
+            // available pane on narrow windows and split views.
+            .width(if (reviewing) 360.dp else 560.dp)
             .padding(horizontal = 8.dp, vertical = 6.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(InlineSurface)
@@ -101,10 +107,6 @@ fun AiInlineEditBar(
                     }
                     reviewing && mod && event.key == Key.Enter -> {
                         onAccept()
-                        true
-                    }
-                    reviewing && mod && event.key == Key.R -> {
-                        onSubmit()
                         true
                     }
                     !reviewing && event.key == Key.Enter && !session.busy -> {
@@ -136,7 +138,23 @@ fun AiInlineEditBar(
                             fontFamily = FontFamily.Monospace,
                         ),
                         cursorBrush = SolidColor(InlineForeground),
-                        modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focus)
+                            .onFocusChanged { state ->
+                                val hasReceivedFocus = promptReceivedFocus || state.isFocused
+                                if (shouldDismissEmptyInlineEdit(
+                                        hasReceivedFocus = hasReceivedFocus,
+                                        isFocused = state.isFocused,
+                                        prompt = session.prompt,
+                                        busy = session.busy,
+                                        reviewing = reviewing,
+                                    )
+                                ) {
+                                    onCancel()
+                                }
+                                promptReceivedFocus = hasReceivedFocus
+                            },
                     )
                     if (session.prompt.isEmpty()) {
                         Text(
@@ -167,10 +185,6 @@ fun AiInlineEditBar(
                 )
             }
         } else {
-            val diff = remember(session.selectionText, session.replacement) {
-                AiInlineDiff.of(session.selectionText, session.replacement)
-            }
-            InlineDiffBody(diff)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -178,7 +192,7 @@ fun AiInlineEditBar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "⌘⏎ accept · esc reject · ⌘R retry",
+                    text = "Ctrl/⌘+Enter accept · Esc reject",
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     color = InlineMuted,
@@ -254,49 +268,6 @@ private fun InlineHeader(session: AiInlineEditService.Session, reviewing: Boolea
 }
 
 @Composable
-private fun InlineDiffBody(diff: List<AiInlineDiff.Line>) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 220.dp)
-            .verticalScroll(rememberScrollState()),
-    ) {
-        diff.forEach { line ->
-            val (fill, fg, sign) =
-                when (line.kind) {
-                    AiInlineDiff.Kind.ADDED -> Triple(InlineAdded.copy(alpha = 0.14f), InlineAdded, "+")
-                    AiInlineDiff.Kind.REMOVED -> Triple(InlineRemoved.copy(alpha = 0.14f), InlineRemoved, "-")
-                    AiInlineDiff.Kind.CONTEXT -> Triple(Color.Transparent, InlineMuted, " ")
-                }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(fill)
-                    .padding(start = 8.dp, end = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = sign,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = fg,
-                    modifier = Modifier.width(10.dp),
-                )
-                Text(
-                    text = line.text.ifEmpty { " " },
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = if (line.kind == AiInlineDiff.Kind.CONTEXT) InlineMuted else InlineForeground,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    softWrap = false,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun InlineCode(text: String, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
@@ -354,6 +325,15 @@ private fun InlineAction(
 }
 
 private const val STREAM_TAIL = 600
+
+/** Click-away only dismisses a pristine prompt, after focus was acquired at least once. */
+internal fun shouldDismissEmptyInlineEdit(
+    hasReceivedFocus: Boolean,
+    isFocused: Boolean,
+    prompt: String,
+    busy: Boolean,
+    reviewing: Boolean,
+): Boolean = hasReceivedFocus && !isFocused && prompt.isEmpty() && !busy && !reviewing
 
 // BOSS semantic tokens - getters in the host, so the card follows the theme.
 private val InlineSurface: Color get() = BossColors.contextMenuBackground

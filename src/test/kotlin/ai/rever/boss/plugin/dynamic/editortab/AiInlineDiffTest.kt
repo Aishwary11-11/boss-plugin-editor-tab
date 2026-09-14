@@ -5,7 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * The diff the Cmd+K review card renders. Pinned because the whole point of
+ * The diff the inline AI review card renders. Pinned because the whole point of
  * showing a diff instead of the raw replacement is that the changed lines are
  * tight - a diff that reports the entire selection as replaced tells the user
  * nothing they can act on.

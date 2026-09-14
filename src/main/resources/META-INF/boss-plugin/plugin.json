@@ -6,6 +6,16 @@
   "apiVersion": "1.0.87",
   "minApiVersion": "1.0.87",
   "minBossVersion": "9.5.12",
+  "dependencies": [
+    {
+      "pluginId": "ai.rever.boss.plugin.dynamic.aigateway",
+      "optional": true
+    },
+    {
+      "pluginId": "ai.rever.boss.plugin.dynamic.secretmanager",
+      "optional": true
+    }
+  ],
   "definedPermissions": [
     {
       "name": "editor.write",
