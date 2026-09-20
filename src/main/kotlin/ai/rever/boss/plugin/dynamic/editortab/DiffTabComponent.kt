@@ -597,8 +597,12 @@ class DiffTabComponent(
                         if (state.isModified.value) {
                             scope.launch {
                                 val text = state.document.getText()
+                                // Staged and moved into place, like the editor tab's save:
+                                // the same truncating write was here too, and applying a
+                                // diff is one of the places a half-written file would be
+                                // hardest to reconstruct. See AtomicFileWrite.
                                 val ok = withContext(Dispatchers.IO) {
-                                    runCatching { File(absolutePath).writeText(text) }.isSuccess
+                                    runCatching { AtomicFileWrite.writeText(File(absolutePath), text) }.isSuccess
                                 }
                                 if (ok) {
                                     state.markAsSaved()

@@ -55,6 +55,11 @@ build.gradle.kts   → Build config + version (single source of truth)
 - Providers from `PluginContext`: `workspaceDataProvider`, `splitViewOperations`, `contextMenuProvider`, `activeTabsProvider`
 - Null-safe provider access: providers may be null, UI must handle gracefully
 
+### Saving
+- **Never `File.writeText` a document.** It truncates the destination before writing, so any failure after that point destroys the previous contents - and auto save fires on a timer, so the window is permanent rather than occasional. `AtomicFileWrite.writeText` stages beside the file, forces, and moves into place; both the editor tab's save and the diff tab's apply go through it (#31).
+- A failed save must leave the document modified, skip `noteWrittenByUs()` and surface the error. `saveFile` returning null is what carries all three, so keep the bookkeeping after the write, never before.
+- The save does **not** go through the host's `EditorContentProvider.writeFileContent`: the plugin cannot tell whether a given host carries BossConsole#427's fix, and routing the editor's own save through the host's editor provider adds a re-entrancy path this plugin has already been bitten by (#18, #27).
+
 ### Dependencies
 - **boss-plugin-api**: compileOnly (provided by host app at runtime)
 - **bosseditor-compose-desktop**: bundled privately; 1.0.26 provides the jsonrpc wire fix (the REQUIRED `jsonrpc` field was being dropped from every outgoing message, so strict servers answered nothing), the pointer-idle hover (`EditorHover`/`hoverProvider`), and the Cmd+Click whitespace/EOL/empty-line snapping used here

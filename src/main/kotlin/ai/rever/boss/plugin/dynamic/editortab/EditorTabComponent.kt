@@ -390,6 +390,11 @@ class EditorTabComponent(
      * Re-baselining the buffer is done here through noteWrittenByUs() rather than by the
      * caller: every save on this file (editor tab, diff tab, MCP tool) is invisible to the
      * watcher the same way.
+     *
+     * The write is staged and moved into place rather than made in the file - see
+     * [AtomicFileWrite] for why, and for what that does and does not promise. A failure
+     * leaves the file exactly as it was, and since this returns null for it, the document
+     * stays modified, the buffer keeps its baseline, and persistDocument shows the error.
      */
     private fun saveFile(content: String): DiskSnapshot? {
         if (filePath.isEmpty()) return null
@@ -398,9 +403,11 @@ class EditorTabComponent(
             val file = File(filePath)
             // Create parent directories if they don't exist (matches bundled editor)
             file.parentFile?.mkdirs()
-            file.writeText(content)
+            AtomicFileWrite.writeText(file, content)
             // SHARED bookkeeping, so the watcher does not report our own write -
             // and so a save made here is seen by every other viewport on this buffer.
+            // After the write, never before: on failure the watcher must still treat
+            // whatever is on disk as somebody else's.
             EditorBufferRegistry.find(filePath)?.noteWrittenByUs()
             snapshotFile()
         } catch (e: Exception) {
