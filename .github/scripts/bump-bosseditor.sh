@@ -30,6 +30,12 @@ OUT="${GITHUB_OUTPUT:-/dev/stdout}"
 emit() { printf '%s\n' "$1" >> "$OUT"; }
 noop() { echo "→ $1"; emit "changed=false"; exit 0; }
 
+# Source overrides are tied to one BossEditor ABI. An automatic update must not
+# replace the guarded dependency until those overrides are removed/reviewed.
+if [ -f src/main/kotlin/ai/rever/bosseditor/README.md ]; then
+  noop "BossEditor compatibility overrides are active; review/remove them before upgrading"
+fi
+
 # 1. Current versions from build.gradle.kts
 current_be=$(sed -n "s/.*implementation(\"com\.risaboss:${ARTIFACT}:\(.*\)\").*/\1/p" "$GRADLE_FILE" | head -1)
 current_plugin=$(sed -n 's/^version = "\(.*\)"/\1/p' "$GRADLE_FILE")
