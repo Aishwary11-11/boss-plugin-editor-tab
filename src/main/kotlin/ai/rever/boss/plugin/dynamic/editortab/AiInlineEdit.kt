@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.bosseditor.core.EditorDocument
 import ai.rever.bosseditor.core.EditorPosition
 import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
@@ -107,11 +108,24 @@ class AiInlineEditService(
         val doc = state.document
         val selection = state.selection.value?.takeIf { state.hasSelection }
         val caret = state.caretPosition.value
-        val start = selection?.start ?: caret
+        var start = selection?.start ?: caret
         val end = selection?.end ?: EditorPosition(start.line, doc.getLineLength(start.line))
-        val startOffset = doc.positionToOffset(start)
+        var startOffset = doc.positionToOffset(start)
         val endOffset = doc.positionToOffset(end)
-        if (startOffset == endOffset) return true // caret on an empty line: consume, nothing to edit
+        if (startOffset == endOffset) {
+            // Caret at the end of a line, or on a blank line: the caret-to-EOL
+            // target is empty. When the line has real text, expand to the whole
+            // line so the compose edits it. When the line is blank, keep the
+            // EMPTY target at the caret - the compose generates there, and the
+            // line's indentation survives instead of being overwritten. Cmd+K
+            // opens the compose regardless of where the caret sits.
+            val lineStart = EditorPosition(start.line, 0)
+            val lineText = doc.getText(doc.positionToOffset(lineStart), endOffset)
+            if (lineText.isNotBlank()) {
+                start = lineStart
+                startOffset = doc.positionToOffset(lineStart)
+            }
+        }
         _session.value =
             Session(
                 selectionText = doc.getText(startOffset, endOffset),
@@ -160,9 +174,16 @@ class AiInlineEditService(
                 }
                 var text = ""
                 try {
+                    // A blank target (an empty line, or a caret parked at the end of
+                    // one) generates at the caret, so attach a few lines of context
+                    // around it: with no file context at all, the model has nothing
+                    // to generate FROM, and its "rewrite" of nothing comes back
+                    // near-empty, which the isBlank check below then reports as an
+                    // error.
+                    val context = if (s.selectionText.isBlank()) caretContext(doc, s.anchorLine, s.anchorCol) else null
                     withContext(Dispatchers.IO) {
                         withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
-                            gateway.stream(buildRequest(s.prompt, s.selectionText, s.language)).collect { chunk ->
+                            gateway.stream(buildRequest(s.prompt, s.selectionText, s.language, context)).collect { chunk ->
                                 when (chunk) {
                                     is AiChunk.Text -> {
                                         text += chunk.text
@@ -326,26 +347,72 @@ class AiInlineEditService(
                 "markdown fences, no commentary, no diff markers, no repetition of " +
                 "surrounding code."
 
+        private const val GENERATE_SYSTEM_PROMPT =
+            "You are an inline code-generation engine. The user placed the caret in " +
+                "code and asked you to generate code there. Output ONLY the code to " +
+                "insert at the caret: no markdown fences, no commentary, no " +
+                "surrounding code, no repetition of context lines."
+
         internal fun buildRequest(
             prompt: String,
             selectionText: String,
             language: String,
-        ): AiRequest =
-            AiRequest(
-                system = SYSTEM_PROMPT,
+            /** A few lines around the caret, generate mode only (see [caretContext]). */
+            context: String? = null,
+        ): AiRequest {
+            val generating = selectionText.isBlank()
+            return AiRequest(
+                system = if (generating) GENERATE_SYSTEM_PROMPT else SYSTEM_PROMPT,
                 messages =
                     listOf(
                         AiMessage.user(
                             "Language: $language\n" +
                                 "Instruction: $prompt\n" +
-                                "<selected_code>\n$selectionText</selected_code>\n" +
-                                "Output only the rewritten selected code.",
+                                if (generating) {
+                                    context?.let { "$it\n" }.orEmpty() +
+                                        "Generate the code to insert at the caret."
+                                } else {
+                                    "<selected_code>\n$selectionText</selected_code>\n" +
+                                        "Output only the rewritten selected code."
+                                },
                         ),
                     ),
                 maxTokens = 4096,
                 timeoutMs = 45_000,
                 temperature = 0f,
             )
+        }
+
+        /**
+         * A few lines before and after [line], for generate mode: a Cmd+K on an
+         * empty line gives the model an instruction and nothing else, so the
+         * nearest context is what makes "generate at the caret" mean anything.
+         * The caret's position inside the block is stated explicitly rather
+         * than marked, so a context that contains `// caret` comments or the
+         * like cannot mislead the model. Null when there is nothing to show.
+         */
+        internal fun caretContext(
+            doc: EditorDocument,
+            line: Int,
+            col: Int = 0,
+            before: Int = 3,
+            after: Int = 3,
+        ): String? {
+            val count = doc.lineCount
+            if (count == 0) return null
+            val clamped = line.coerceIn(0, count - 1)
+            val from = (clamped - before).coerceAtLeast(0)
+            var to = (clamped + after).coerceAtMost(count - 1)
+            // A trailing blank line reads as a separator, not as context -
+            // drop it, but NEVER above the caret: the stated caret line must
+            // always exist inside the block. Trimming below the caret keeps
+            // the caret's own (blank) line as the block's last line.
+            while (to > clamped && doc.getLineLength(to) == 0) to--
+            if (from == to && doc.getLineLength(from) == 0) return null
+            val block = (from..to).joinToString("\n") { doc.getLineText(it) }
+            return "<context>\n$block\n</context>\n" +
+                "The caret is on line ${clamped - from + 1} (1-based) of this block, column ${col + 1}."
+        }
 
         internal fun stripFences(text: String): String {
             var t = text
@@ -365,6 +432,14 @@ internal fun applyAcceptedAiInlineEdit(
     replacement: String,
 ) {
     state.undoManager.breakUndoGroup()
+    if (start == end) {
+        // Degenerate (generate-mode) target: an empty selection inserts at
+        // the LIVE caret, not at the captured one - and the staleness guard
+        // only compares the buffer version, so a pointer that wandered while
+        // the preview was open would silently land the code somewhere else.
+        // Move the caret to the captured position first.
+        state.moveCaretToOffset(state.document.positionToOffset(start))
+    }
     state.setSelection(EditorRange(start, end))
     state.insertText(replacement)
     state.undoManager.breakUndoGroup()

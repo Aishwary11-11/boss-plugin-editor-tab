@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
+import ai.rever.bosseditor.compose.EditorHover
 import ai.rever.bosseditor.compose.NavigationResolveResult
 import ai.rever.bosseditor.lsp.client.LspClient
 import ai.rever.bosseditor.lsp.client.LspMethods
@@ -13,7 +14,9 @@ import ai.rever.bosseditor.lsp.server.LanguageServerRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -89,6 +92,17 @@ class LspNavigation {
     /** A broken installed server gets one expensive start attempt per cooldown, not one per click. */
     private val startupFailures = FailureCooldown<ServerKey, StartupFingerprint>(START_FAILURE_COOLDOWN_MS)
 
+    /**
+     * Clients already logged a hover timeout. Identity-based: two distinct
+     * clients for the same language must each get their one warning. Hover
+     * times out far more often than clicks (moving pointer, slow server), and
+     * a per-request line would be a steady drip to stderr. Concurrent for the
+     * same reason [opened] is: resolveHover reaches it from every tab's IO
+     * dispatcher at once, and dispose clears it from the unload thread.
+     * Identity semantics come from LspClient inheriting Any's identity equals.
+     */
+    private val hoverTimeoutLogged: MutableSet<LspClient> = ConcurrentHashMap.newKeySet()
+
     private data class ServerKey(val languageId: String, val root: String)
 
     private data class StartupFingerprint(
@@ -140,23 +154,168 @@ class LspNavigation {
         }
     }
 
-    private suspend fun resolve(
+    /**
+     * The hover for the symbol at [offset], or null when there is nothing to show.
+     *
+     * The mirror of [resolveDefinition] for `textDocument/hover`: the same server
+     * lifecycle, document sync and request timeout, with one difference - a null
+     * answer is a normal outcome (the pointer rested on a symbol with no
+     * signature or docs, or the server advertises no hover capability), not a
+     * failure. The editor only shows the tooltip for a non-null result, so an
+     * operational error degrades to "no hover", matching how the pointer
+     * behaves over an unsupported file.
+     */
+    suspend fun resolveHover(
         content: String,
         filePath: String,
         offset: Int,
         projectPath: String?,
-    ): NavigationResolveResult {
+    ): EditorHover? = withContext(Dispatchers.IO) {
+        if (disposed) return@withContext null
+        val acquired = try {
+            acquireClient(content, filePath, projectPath)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: LinkageError) {
+            System.err.println(
+                "[LspNavigation] ${error::class.simpleName} acquiring server for hover '$filePath': ${error.message}",
+            )
+            return@withContext null
+        } catch (error: Exception) {
+            // acquireClient already recorded the failure and tore down the
+            // half-started process; there is no live client to reap here.
+            System.err.println(
+                "[LspNavigation] ${error::class.simpleName} acquiring server for hover '$filePath': ${error.message}",
+            )
+            return@withContext null
+        } ?: return@withContext null
+        try {
+            // Hover snaps are BOUNDED (unlike the click path's): the pointer merely
+            // idled here, so the answer is asked for the symbol within reach, not
+            // whatever word the unbounded scan would find on the line.
+            val position = offsetToPosition(content, snapToNearestWord(content, offset, HOVER_SNAP_MAX_DISTANCE))
+            val settings = LspSettingsManager.instance.configuration.value
+            // Hover is a probe, not a request: the pointer merely idled here, and
+            // an answer that lands seconds after it moved is useless. A click
+            // gets the full configured budget; hover gets its own, shorter one
+            // (the server is warm from open anyway).
+            val hoverTimeoutMs = minOf(settings.defaultRequestTimeoutMs, HOVER_REQUEST_TIMEOUT_MS)
+            when (val result = ownTimeout(hoverTimeoutMs) {
+                LspNavigationProvider(acquired.client).getHover(acquired.uri, position)
+            }) {
+                is TimedResult.Value -> {
+                    val hover = result.value ?: return@withContext null
+                    EditorHover(text = hover.text, isMarkdown = hover.isMarkdown)
+                }
+                TimedResult.TimedOut -> {
+                    // A slow hover answer is not a dead server: keep it warm for the
+                    // next question (definition clicks and other tabs included).
+                    // Hover fires far more often than clicks, so log the first
+                    // timeout per client, not a line per pointer movement.
+                    if (hoverTimeoutLogged.add(acquired.client)) {
+                        System.err.println(
+                            "[LspNavigation] hover timed out after ${hoverTimeoutMs}ms for '$filePath'",
+                        )
+                    }
+                    if (!acquired.client.isInitialized) {
+                        stopClientIfCurrent(acquired.key, acquired.client, acquired.manager, acquired.languageId)
+                    }
+                    null
+                }
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: LinkageError) {
+            System.err.println(
+                "[LspNavigation] ${error::class.simpleName} hovering '$filePath': ${error.message}",
+            )
+            null
+        } catch (error: Exception) {
+            // The definition path reaps a client that died mid-request; hover must
+            // do the same, or whether a dead server is reaped depends on whether
+            // the pointer or a Cmd+Click noticed first (hover fires far more often).
+            System.err.println(
+                "[LspNavigation] ${error::class.simpleName} hovering '$filePath': ${error.message}",
+            )
+            if (!acquired.client.isInitialized) {
+                stopClientIfCurrent(acquired.key, acquired.client, acquired.manager, acquired.languageId)
+            }
+            null
+        }
+    }
+
+    /**
+     * Start (or reuse) the server for [filePath]'s language and sync [content]
+     * into it, without asking it anything.
+     *
+     * Called when the tab opens so the FIRST hover or Cmd+Click does not pay
+     * the cold start - process spawn, initialize, document sync, settle delay -
+     * which is several seconds of the user's first gesture seeing nothing.
+     * A file nothing can serve (feature off, no registered server, binary
+     * missing, in cooldown) is a silent no-op: the real lookup will surface
+     * the same outcome later.
+     */
+    suspend fun warmUp(content: String, filePath: String, projectPath: String?): Unit =
+        withContext(Dispatchers.IO) {
+            if (disposed) return@withContext
+            if (!LspSettingsManager.instance.configuration.value.enabled) return@withContext
+            try {
+                acquireClient(content, filePath, projectPath)
+                Unit
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: LinkageError) {
+                // Same reason as resolve/resolveHover: a parent-first host copy
+                // can still expose an older API. warmUp is the most exposed
+                // case - it runs from a LaunchedEffect with no user gesture, so
+                // an uncaught Error here takes down the tab on open, for every
+                // servable file.
+                System.err.println(
+                    "[LspNavigation] ${error::class.simpleName} warming '$filePath': ${error.message}",
+                )
+            } catch (error: Exception) {
+                System.err.println(
+                    "[LspNavigation] warm-up failed for '$filePath': ${error.message}",
+                )
+            }
+        }
+
+    /** A live, initialized client that already knows the document being asked about. */
+    private data class Acquired(
+        val client: LspClient,
+        val manager: LanguageServerManager,
+        val key: ServerKey,
+        val languageId: String,
+        val uri: String,
+        val root: String,
+    )
+
+    /**
+     * Start or reuse the server for [filePath]'s language and hand it the current
+     * buffer. Returns null when nothing can answer (feature off, no registered
+     * server, binary missing, or the last start attempt is still cooling down).
+     *
+     * Shared cold-start path of every LSP feature in this class (definition,
+     * hover): the per language/root manager, the mutex that serialises start +
+     * sync, the failure cooldown, and the document sync all live here so a new
+     * feature cannot silently fork a second, subtly different server lifecycle.
+     */
+    private suspend fun acquireClient(
+        content: String,
+        filePath: String,
+        projectPath: String?,
+    ): Acquired? {
         val settings = LspSettingsManager.instance.configuration.value
-        if (!settings.enabled) return NavigationResolveResult.NotFound
+        if (!settings.enabled) return null
         // LspSettingsManager applies both built-in enablement and enabled custom servers to
         // the registry. Trust the selected, enabled config here; a separate disabled-language
         // check would incorrectly reject a custom replacement for a disabled built-in server.
-        val config = LanguageServerRegistry.getConfigForFile(filePath) ?: return NavigationResolveResult.NotFound
+        val config = LanguageServerRegistry.getConfigForFile(filePath) ?: return null
         // A server rooted at the wrong directory resolves nothing outside the file
         // itself, so prefer the project and fall back to the file's own folder.
         val root = projectPath?.takeIf { it.isNotBlank() }
             ?: File(filePath).parentFile?.absolutePath
-            ?: return NavigationResolveResult.NotFound
+            ?: return null
 
         // The server binary has to exist before we try to run it. Without this a
         // missing `pylsp`/`typescript-language-server` costs a failed spawn and
@@ -165,12 +324,12 @@ class LspNavigation {
         //
         // Resolved against the USER's PATH, not this process's - see [launchPath].
         val launchable = launchConfig(config, workingDirectory = root)
-            ?: return NavigationResolveResult.NotFound
+            ?: return null
 
         val key = ServerKey(config.languageId, canonicalRoot(root))
         val uri = fileUri(filePath)
         val fingerprint = StartupFingerprint(launchable, settings)
-        if (startupFailures.isCoolingDown(key, fingerprint)) return NavigationResolveResult.NotFound
+        if (startupFailures.isCoolingDown(key, fingerprint)) return null
 
         val manager = managers.computeIfAbsent(key) { LanguageServerManager() }
         // Both the manager and this outer lock are per language/root, so a hanging Python
@@ -194,6 +353,14 @@ class LspNavigation {
                 // reaches this branch and must not blacklist a healthy server.
                 throw cancellation
             } catch (error: Exception) {
+                // Defence in depth: if WE are already cancelled, this "failure" is our own
+                // withdrawal (a superseded hover, a closed tab, a re-set buffer), not the
+                // server's. Recording it would burn the five-minute cooldown and silently
+                // disable navigation for the whole workspace, and stopFailedServer would tear
+                // down a healthy shared process from under every other tab.
+                if (!currentCoroutineContext().isActive) {
+                    throw CancellationException("Cancelled during language server start", error)
+                }
                 startupFailures.record(key, fingerprint)
                 // LanguageServerManager installs the client in its map before initialize. Remove
                 // that half-started process now; otherwise every cooldown retains one orphan.
@@ -229,13 +396,28 @@ class LspNavigation {
             // can observe `fresh = false` and send its request before the server is actually ready.
             if (fresh) delay(COLD_START_SETTLE_MS)
             c
-        } ?: return NavigationResolveResult.NotFound
+        } ?: return null
 
-        val position = offsetToPosition(content, offset)
+        return Acquired(client, manager, key, config.languageId, uri, root)
+    }
+
+    private suspend fun resolve(
+        content: String,
+        filePath: String,
+        offset: Int,
+        projectPath: String?,
+    ): NavigationResolveResult {
+        val acquired = acquireClient(content, filePath, projectPath)
+            ?: return NavigationResolveResult.NotFound
+
+        val position = offsetToPosition(content, snapToNearestWord(content, offset))
+        // Captured once: the timeout applied below and the one logged on the TimedOut
+        // branch must agree, even if the settings are reloaded mid-request.
+        val settings = LspSettingsManager.instance.configuration.value
         val requested = try {
             ownTimeout(settings.defaultRequestTimeoutMs) {
-                LspNavigationProvider(client)
-                    .goToDefinition(uri, position)
+                LspNavigationProvider(acquired.client)
+                    .goToDefinition(acquired.uri, position)
                     .firstOrNull()
             }
         } catch (cancellation: CancellationException) {
@@ -243,7 +425,9 @@ class LspNavigation {
         } catch (error: Exception) {
             // A transport failure marks the client dead; a decode/provider error on a still-live
             // shared server must not tear it out from under every other tab in this workspace.
-            if (!client.isInitialized) stopClientIfCurrent(key, client, manager, config.languageId)
+            if (!acquired.client.isInitialized) {
+                stopClientIfCurrent(acquired.key, acquired.client, acquired.manager, acquired.languageId)
+            }
             throw error
         }
         val location = when (requested) {
@@ -252,15 +436,19 @@ class LspNavigation {
                 // A slow project is not a dead process. Keep an initialized shared server warm so
                 // the next click can benefit from the work it has already done.
                 System.err.println(
-                    "[LspNavigation] definition timed out after ${settings.defaultRequestTimeoutMs}ms for '$filePath'",
+                    "[LspNavigation] definition timed out after " +
+                        "${settings.defaultRequestTimeoutMs}ms " +
+                        "for '$filePath'",
                 )
-                if (!client.isInitialized) stopClientIfCurrent(key, client, manager, config.languageId)
+                if (!acquired.client.isInitialized) {
+                    stopClientIfCurrent(acquired.key, acquired.client, acquired.manager, acquired.languageId)
+                }
                 return NavigationResolveResult.NotFound
             }
         }
 
         val targetPath = uriToPath(location.uri)
-            ?.let { restoreRootAlias(it, key.root, root) }
+            ?.let { restoreRootAlias(it, acquired.key.root, acquired.root) }
             ?: return NavigationResolveResult.NotFound
         // LSP positions are 0-based; NavigationTarget - and so openFileAtPosition,
         // which both this and the PSI path feed - is 1-based on both axes.
@@ -295,6 +483,7 @@ class LspNavigation {
             stopFailedServer(manager, languageId)
             clients.remove(key, client)
             opened.remove(client)
+            hoverTimeoutLogged.remove(client)
         }
     }
 
@@ -341,13 +530,23 @@ class LspNavigation {
 
     private fun trackClient(key: ServerKey, client: LspClient): Boolean {
         val previous = clients.put(key, client)
-        previous?.takeIf { it !== client }?.let(opened::remove)
+        previous?.takeIf { it !== client }?.let {
+            opened.remove(it)
+            hoverTimeoutLogged.remove(it)
+        }
         return previous !== client
     }
 
     /** Test seam for the restart eviction invariant without constructing a real manager. */
     internal fun trackClient(languageId: String, root: String, client: LspClient): Boolean =
         trackClient(ServerKey(languageId, root), client)
+
+    /** Test seams for the hover-timeout dedupe set, without driving a real timeout. */
+    internal fun hoverTimeoutLogged(client: LspClient): Boolean = hoverTimeoutLogged.contains(client)
+
+    internal fun markHoverTimeoutLogged(client: LspClient) {
+        hoverTimeoutLogged.add(client)
+    }
 
     internal fun didOpen(uri: String, languageId: String, content: String): JsonElement =
         buildJsonObject {
@@ -422,6 +621,7 @@ class LspNavigation {
         opened.clear()
         clients.clear()
         startupFailures.clear()
+        hoverTimeoutLogged.clear()
     }
 
     companion object {
@@ -446,6 +646,24 @@ class LspNavigation {
         private const val STOP_FAILED_SERVER_TIMEOUT_MS = 2_000L
         private const val START_TIMEOUT_COOLDOWN_MS = 10_000L
         private const val START_FAILURE_COOLDOWN_MS = 5 * 60 * 1_000L
+
+        /**
+         * How far a HOVER snap may scan from the pointer before giving up
+         * (see [snapToNearestWord]). Mirrors the editor's own idle-hover snap
+         * bound (BossEditor `nearestWordCharAt`, 3 chars): far enough to catch
+         * the pointer parking a character or two off the symbol, close enough
+         * that a pointer idling in the blank area right of a line's text does
+         * not raise the last token's docs. Cmd+Click stays unbounded.
+         */
+        internal const val HOVER_SNAP_MAX_DISTANCE = 3
+
+        /**
+         * Hover's own request budget, in ms. A click may wait the full
+         * configured timeout for an answer the user explicitly asked for; a
+         * hover is an incidental probe, so it gets a shorter fixed budget and
+         * the pointer has usually moved on by the time a 30s answer lands.
+         */
+        private const val HOVER_REQUEST_TIMEOUT_MS = 1_500L
 
         /**
          * One instance for the whole plugin.
@@ -652,6 +870,57 @@ class LspNavigation {
             }
             return Position(line = line, character = end - lineStart)
         }
+
+        /**
+         * Snap an offset onto the nearest word character, staying on the same line.
+         *
+         * Language servers only answer `definition`/`hover` for a position that is
+         * ON a symbol; a Cmd+Click that lands in the whitespace around a word would
+         * otherwise resolve to nothing. The LSP word convention applies - letters,
+         * digits and underscore - and the preference is left first (the pointer
+         * just passed the word), then right, matching how a click between two
+         * words reads.
+         *
+         * [maxDistance] bounds how far either scan may run before giving up and
+         * returning [offset] unchanged. Cmd+Click passes the default (unbounded):
+         * a click anywhere on the line is an explicit "this word" gesture. Hover
+         * passes a small bound instead - the pointer merely idled here, so a
+         * tooltip that fires from the blank area right of a line's text (the
+         * unbounded scan runs back to `lineStart`) or from a resting `)`/`}` is a
+         * feature nobody asked for.
+         *
+         * The bound must hold on BOTH scans: the loop can exit one char PAST the
+         * bound (it stops when `right - o` would exceed it) and a later check
+         * that forgot the bound would still return that char - a tooltip that
+         * fires 4 columns before a symbol but not 4 columns after it.
+         *
+         * Sibling implementations run in series with this one, in the
+         * BossEditor repo (desktopMain): `EditorHover.nearestWordCharAt` snaps
+         * the pointer column before the hoverProvider is ever called (same
+         * bound, same word-char set - digits count as word chars there too),
+         * and `navigationSnapColumn` is the editor-side click snap, which skips
+         * pure numbers and has no bound. Change either with the others in mind.
+         */
+        internal fun snapToNearestWord(
+            content: String,
+            offset: Int,
+            maxDistance: Int = Int.MAX_VALUE,
+        ): Int {
+            val o = offset.coerceIn(0, content.length)
+            if (o < content.length && isWordChar(content[o])) return o
+            val lineEnd = content.indexOf('\n', o.coerceAtMost(content.length - 1).coerceAtLeast(0))
+                .takeIf { it != -1 } ?: content.length
+            val lineStart = if (o <= 0) 0 else content.lastIndexOf('\n', o - 1) + 1
+            var left = o - 1
+            while (left >= lineStart && o - left <= maxDistance && !isWordChar(content[left])) left--
+            if (left >= lineStart && o - left <= maxDistance && isWordChar(content[left])) return left
+            var right = o
+            while (right < lineEnd && right - o <= maxDistance && !isWordChar(content[right])) right++
+            if (right < lineEnd && right - o <= maxDistance && isWordChar(content[right])) return right
+            return o
+        }
+
+        private fun isWordChar(c: Char): Boolean = c.isLetterOrDigit() || c == '_'
 
         /** `file:///a/b.ts` -> `/a/b.ts`, with percent-escapes resolved. */
         internal fun uriToPath(uri: String): String? =

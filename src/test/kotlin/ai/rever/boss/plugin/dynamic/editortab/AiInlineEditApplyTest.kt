@@ -19,4 +19,16 @@ class AiInlineEditApplyTest {
         assertTrue(state.undo())
         assertEquals("val answer = oldValue\n", state.document.getText())
     }
+
+    @Test
+    fun `a generated insertion lands at the captured caret, not the live one`() {
+        // The degenerate (generate-mode) range: start == end. An empty
+        // selection inserts at the LIVE caret, so if the pointer wandered
+        // while the preview was open, the code must still land where the
+        // session was captured.
+        val state = EditorState("first()\n\nlast()\n", null)
+        state.moveCaretToOffset(0) // caret moved away after the session was captured
+        applyAcceptedAiInlineEdit(state, EditorPosition(1, 0), EditorPosition(1, 0), "middle()")
+        assertEquals("first()\nmiddle()\nlast()\n", state.document.getText())
+    }
 }
