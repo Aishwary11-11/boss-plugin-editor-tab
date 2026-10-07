@@ -69,7 +69,7 @@ class EditorTabPluginAPIImpl(
         EditorHostThemeEffects()
 
         val settingsManager = remember { EditorSettingsManager.instance }
-        val currentSettings by settingsManager.settings.collectAsState()
+        val currentSettings by editorSettingsFlow(settingsManager).collectAsState()
         val markdownSettings by markdownSettingsManager.settings.collectAsState()
         val autoSaveEnabled by autoSaveSettingsManager.enabled.collectAsState()
         val externalReloadEnabled by externalReloadSettingsManager.enabled.collectAsState()

@@ -741,7 +741,7 @@ class DiffTabComponent(
         pane: DiffSides.Pane,
         state: EditorState,
     ) {
-        val settings by PluginEditorSettings.settings.collectAsState()
+        val settings by editorSettingsFlow().collectAsState()
         val viewport by state.visibleViewport.collectAsState()
         val scroll by state.scrollOffset.collectAsState()
         val mapper by state.visualLineMapper.collectAsState()
@@ -1037,7 +1037,7 @@ class DiffTabComponent(
         marks: List<DiffSides.OverviewMark?>,
         state: EditorState,
     ) {
-        val settings by PluginEditorSettings.settings.collectAsState()
+        val settings by editorSettingsFlow().collectAsState()
         val viewport by state.visibleViewport.collectAsState()
         val mapper by state.visualLineMapper.collectAsState()
         val document = state.document

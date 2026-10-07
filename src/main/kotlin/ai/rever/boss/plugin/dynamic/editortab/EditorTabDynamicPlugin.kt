@@ -62,7 +62,6 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         if (pluginScope != null) {
             ExternalChangeWatcher.uninstall()
             AiCompletionSettings.stop()
-            PluginEditorSettings.stop()
             pluginScope?.cancel()
             pluginScope = null
             composerSessions = null
@@ -175,11 +174,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         ExternalChangeWatcher.install(watcherScope, { context.gitDataProvider }) {
             externalReloadSettingsManager?.enabled?.value ?: true
         }
-        // The two settings file-polls used to run on GlobalScope, where nothing
-        // could cancel them (they held this classloader alive after unload).
-        // Run them on the plugin scope instead, stopped in dispose().
+        // AI completion remains plugin-owned and file-backed. Core editor settings use
+        // BossEditor's reactive singleton directly and need no plugin-side poll.
         AiCompletionSettings.start(watcherScope)
-        PluginEditorSettings.start(watcherScope)
 
         // Warm up the bundled PSI stack off the UI thread. The host did this at
         // startup while BossEditor was on its classpath; the plugin owns it now.
@@ -203,10 +200,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // Language servers are child processes, and nothing else reaps them:
         // without this an unload leaves one per language running until BOSS exits.
         LspNavigation.disposeShared()
-        // Stop the settings file-polls explicitly; scope cancellation below
+        // Stop the plugin-owned settings poll explicitly; scope cancellation below
         // is a backstop, not the mechanism.
         AiCompletionSettings.stop()
-        PluginEditorSettings.stop()
         pluginScope?.cancel()
         pluginScope = null
 

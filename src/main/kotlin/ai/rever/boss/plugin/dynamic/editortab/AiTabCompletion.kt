@@ -66,7 +66,7 @@ data class AiCompletionSettingsData(
     val maxSuffixChars: Int = 400,
 )
 
-/** Reactive settings from ~/.boss/ai-completion-settings.json (PluginEditorSettings pattern). */
+/** Reactive settings from the plugin-owned ai-completion-settings.json file. */
 object AiCompletionSettings {
     private val settingsFile = BossPaths.settingsFile("ai-completion-settings.json")
     private val json = Json {
