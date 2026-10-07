@@ -435,8 +435,15 @@ class MarkdownPreviewShellTest {
                 PreviewLinkRoute.Refuse,
                 previewLinkRoute(link.toURI().toString(), root.path)
             )
-        } catch (_: UnsupportedOperationException) {
-            return // no symlink support on this filesystem
+        } catch (failure: UnsupportedOperationException) {
+            org.junit.Assume.assumeNoException("Symlinks are unsupported by this filesystem", failure)
+        } catch (failure: java.nio.file.FileSystemException) {
+            if (System.getProperty("os.name").startsWith("Windows") &&
+                failure.reason.orEmpty().contains("privilege", ignoreCase = true)) {
+                org.junit.Assume.assumeNoException("This Windows account lacks symlink privileges", failure)
+            } else {
+                throw failure
+            }
         } finally {
             listOf(link, outside, root, parent).forEach { it.delete() }
         }

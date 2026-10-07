@@ -4,12 +4,21 @@ import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
-import java.nio.file.FileSystemException
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileSystemLoopException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermissions
+import java.nio.file.attribute.PosixFileAttributes
+import java.nio.file.attribute.AclFileAttributeView
+import java.nio.file.attribute.AclEntry
+import java.nio.file.attribute.FileOwnerAttributeView
+import java.nio.file.attribute.UserPrincipal
+import java.nio.file.attribute.DosFileAttributeView
+import java.nio.file.attribute.DosFileAttributes
 
 /**
  * Writing a document without being able to destroy the one already there (#31).
@@ -27,22 +36,8 @@ import java.nio.file.attribute.PosixFileAttributeView
  * staging file deleted; the move itself is the only step that changes what the path
  * points at.
  *
- * **Why not the host's `EditorContentProvider.writeFileContent`**, which BossConsole#427
- * is making safe and which this plugin's `editor_write_file` tool already uses:
- *
- * - It is not safe yet, and the plugin cannot tell whether a given host carries the fix.
- *   Plugins release independently of the host, so a version that routed saves through an
- *   older host's provider would still truncate the user's file - a regression handed to
- *   exactly the users this change exists to protect. There is no capability query to
- *   gate that on, and the provider returns only `Boolean`.
- * - The editor tab is the editor. Its save has always gone straight to disk, and sending
- *   it through the host's *editor content* provider would make a save a round trip
- *   through the subsystem that owns editor buffers. That is a new path with its own
- *   re-entrancy questions, and this plugin has already shipped one stack overflow on the
- *   provider route (#18, #27).
- *
- * This is the same staged-write contract as the host PR rather than a divergent one, and
- * when the API can say "this host writes safely", the two collapse into one call.
+ * The plugin writes locally because published hosts still use a truncating provider
+ * implementation. This protection therefore does not depend on a host update.
  *
  * **What atomicity does and does not promise.** The rename is atomic on POSIX and on
  * NTFS, so a reader sees either the old file or the new one, never a partial document.
@@ -50,9 +45,8 @@ import java.nio.file.attribute.PosixFileAttributeView
  * the old file keep the old contents, and anything holding the path open by inode is
  * looking at the previous version. A symlink destination is resolved first and written
  * through, so the link survives instead of being replaced by a regular file. Where
- * `ATOMIC_MOVE` is refused - some network filesystems, and Windows when a scanner or
- * sync agent holds the target open - the move is retried non-atomically, which is a
- * narrower window than a truncating write but not a closed one.
+ * the filesystem does not support `ATOMIC_MOVE`, saving fails with the original file
+ * intact instead of silently accepting a destructive non-atomic fallback.
  */
 internal object AtomicFileWrite {
 
@@ -72,7 +66,7 @@ internal object AtomicFileWrite {
         // Write through a symlink rather than over it: dotfiles and shared config are
         // routinely symlinked into a project, and replacing the link with a regular file
         // silently detaches it from whatever it pointed at.
-        val target = resolveLink(file.toPath())
+        val target = resolveLink(file.toPath().toAbsolutePath())
         val directory = target.parent
             ?: throw IOException("Cannot save ${file.path}: it has no parent directory")
 
@@ -80,12 +74,25 @@ internal object AtomicFileWrite {
         // Cmd+S can overlap, and two writers sharing one staging path would interleave
         // their bytes and then move the result into place - a corrupt document produced
         // by the mechanism meant to prevent one.
-        val staging = Files.createTempFile(directory, file.name, STAGING_SUFFIX)
+        if (Files.exists(target) && (!Files.isRegularFile(target) || !Files.isWritable(target))) {
+            throw IOException("Cannot save $target: the destination is not a writable regular file")
+        }
+        val metadata = captureMetadata(target)
+        // Match a normal new file's umask-filtered permissions. Existing documents keep
+        // private staging until their original mode is copied before commit.
+        val attributes = if (!Files.exists(target) &&
+            Files.getFileStore(directory).supportsFileAttributeView(PosixFileAttributeView::class.java)) {
+            arrayOf(PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-rw-rw-")))
+        } else {
+            emptyArray()
+        }
+        val staging = Files.createTempFile(directory, "boss-", STAGING_SUFFIX, *attributes)
         try {
+            // Access policy must be present before edited bytes reach staging, especially
+            // where a Windows directory grants broader inherited access than the file.
+            metadata?.applyAccessTo(staging)
             stage(staging, content)
-            // The destination's mode, not the staging file's: createTempFile is 0600, so
-            // without this a save would quietly make a group-readable file private.
-            copyPermissions(from = target, to = staging)
+            metadata?.applyDosTo(staging)
             replace(staging, target)
             // The rename is metadata of its own: forcing the file's bytes does not
             // persist the directory entry that points at them.
@@ -115,37 +122,75 @@ internal object AtomicFileWrite {
         }
     }
 
-    /** The file a symlink points at, or [path] itself. */
-    private fun resolveLink(path: Path): Path =
-        if (Files.isSymbolicLink(path)) {
-            // A dangling link - a stale relative target, a half-synced cloud folder -
-            // makes toRealPath throw. Writing to the link path then creates the file the
-            // link promises, which is better than refusing to save.
-            runCatching { path.toRealPath() }.getOrDefault(path)
-        } else {
-            path
+    /** Resolve final-component links even when their target does not exist yet. */
+    private fun resolveLink(path: Path): Path {
+        var target = path
+        val seen = mutableSetOf<Path>()
+        while (Files.isSymbolicLink(target)) {
+            // Resolve existing parents as well, so aliases cannot hide a link cycle.
+            target = target.parent.toRealPath().resolve(target.fileName)
+            if (!seen.add(target)) throw FileSystemLoopException(path.toString())
+            val link = Files.readSymbolicLink(target)
+            target = if (link.isAbsolute) link else target.parent.resolve(link)
+        }
+        return target
+    }
+
+    private data class Metadata(
+        val posix: PosixFileAttributes?,
+        val owner: UserPrincipal?,
+        val acl: List<AclEntry>?,
+        val dos: DosFileAttributes?,
+    ) {
+        fun applyAccessTo(path: Path) {
+            if (owner != null) {
+                val view = Files.getFileAttributeView(path, FileOwnerAttributeView::class.java)
+                    ?: throw IOException("Cannot preserve file ownership")
+                if (view.owner != owner) view.owner = owner
+            }
+            if (posix != null) {
+                val view = Files.getFileAttributeView(path, PosixFileAttributeView::class.java)
+                    ?: throw IOException("Cannot preserve POSIX permissions")
+                if (view.readAttributes().group() != posix.group()) view.setGroup(posix.group())
+                view.setPermissions(posix.permissions())
+            }
+            if (acl != null) {
+                val view = Files.getFileAttributeView(path, AclFileAttributeView::class.java)
+                    ?: throw IOException("Cannot preserve file ACL")
+                view.acl = acl
+            }
         }
 
-    /** Mirror [from]'s POSIX mode onto [to], where the platform has one. */
-    private fun copyPermissions(from: Path, to: Path) {
-        runCatching {
-            if (!Files.exists(from)) return
-            val view = Files.getFileAttributeView(from, PosixFileAttributeView::class.java) ?: return
-            Files.setPosixFilePermissions(to, view.readAttributes().permissions())
+        fun applyDosTo(path: Path) {
+            if (dos != null) {
+                val view = Files.getFileAttributeView(path, DosFileAttributeView::class.java)
+                    ?: throw IOException("Cannot preserve DOS file attributes")
+                view.setHidden(dos.isHidden)
+                view.setSystem(dos.isSystem)
+                view.setArchive(dos.isArchive)
+                view.setReadOnly(dos.isReadOnly)
+            }
         }
+    }
+
+    /** Capture supported views before staging; supported read/write failures fail closed. */
+    private fun captureMetadata(path: Path): Metadata? {
+        if (!Files.exists(path)) return null
+        return Metadata(
+            posix = Files.getFileAttributeView(path, PosixFileAttributeView::class.java)?.readAttributes(),
+            owner = Files.getFileAttributeView(path, FileOwnerAttributeView::class.java)?.owner,
+            acl = Files.getFileAttributeView(path, AclFileAttributeView::class.java)?.acl?.toList(),
+            dos = Files.getFileAttributeView(path, DosFileAttributeView::class.java)?.readAttributes(),
+        )
     }
 
     /** Install [staging] at [target], atomically where the filesystem allows it. */
     private fun replace(staging: Path, target: Path) {
         try {
             Files.move(staging, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-        } catch (e: FileSystemException) {
-            // Not only AtomicMoveNotSupportedException: on Windows a target held open by
-            // an indexer, a backup agent or a sync client surfaces as
-            // AccessDeniedException. Both are FileSystemException, and both are worth one
-            // non-atomic retry rather than failing a save the user asked for.
-            System.err.println("[AtomicFileWrite] Atomic move refused for $target (${e.message}); retrying")
-            Files.move(staging, target, StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: AtomicMoveNotSupportedException) {
+            throw IOException("Cannot safely save $target: this filesystem does not support atomic replacement. " +
+                "Save a copy on a local filesystem instead.", e)
         }
     }
 }

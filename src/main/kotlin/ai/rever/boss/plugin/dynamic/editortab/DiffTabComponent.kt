@@ -400,6 +400,7 @@ class DiffTabComponent(
         onEditableChanged: (Boolean) -> Unit,
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
+        val resolutionScope = rememberCoroutineScope()
         // [canEdit] hops its own dispatchers - the disk read to IO, the live
         // document comparison to Main - so this effect only has to ask the
         // question, once per key change while the pane is read-only.
@@ -435,6 +436,7 @@ class DiffTabComponent(
         content: @Composable (state: EditorState, editable: Boolean) -> Unit,
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
+        val resolutionScope = rememberCoroutineScope()
 
         // Acquire and release are keyed IDENTICALLY, on the slot. The acquire
         // has to be asynchronous (a whole-file read must not run on the
@@ -469,7 +471,27 @@ class DiffTabComponent(
         val editable = buffer != null
 
         if (editable && absolutePath != null) {
-            SaveOnCommandS(state, absolutePath, onNote) { content(state, true) }
+            val editableBuffer = buffer ?: return
+            Column(modifier = Modifier.fillMaxSize()) {
+                ExternalChangeBar(
+                    buffer = editableBuffer,
+                    onReload = {
+                        resolutionScope.launch {
+                            ExternalChangeWatcher.current()?.resolveByReloading(editableBuffer)
+                            onNote(null)
+                        }
+                    },
+                    onKeepMine = {
+                        resolutionScope.launch {
+                            ExternalChangeWatcher.current()?.resolveByKeepingMine(editableBuffer)
+                            onNote(null)
+                        }
+                    },
+                )
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    SaveOnCommandS(state, absolutePath, onNote) { content(state, true) }
+                }
+            }
         } else {
             content(state, false)
         }
@@ -596,25 +618,9 @@ class DiffTabComponent(
                     if (event.type == KeyEventType.KeyDown && meta && event.key == Key.S) {
                         if (state.isModified.value) {
                             scope.launch {
-                                val text = state.document.getText()
-                                // Staged and moved into place, like the editor tab's save:
-                                // the same truncating write was here too, and applying a
-                                // diff is one of the places a half-written file would be
-                                // hardest to reconstruct. See AtomicFileWrite.
-                                val ok = withContext(Dispatchers.IO) {
-                                    runCatching { AtomicFileWrite.writeText(File(absolutePath), text) }.isSuccess
-                                }
-                                if (ok) {
-                                    state.markAsSaved()
-                                    // Shared bookkeeping: without this a save
-                                    // made from the diff tab looks to the
-                                    // watcher - and to any editor tab on the
-                                    // same file - like an external change.
-                                    EditorBufferRegistry.find(absolutePath)?.noteWrittenByUs()
-                                    onNote("Saved")
-                                } else {
-                                    onNote("Failed to save")
-                                }
+                                val result = EditorBufferRegistry.find(absolutePath)
+                                    ?.let { saveEditorDocument(it) } ?: DocumentSaveResult.UNAVAILABLE
+                                onNote(if (result == DocumentSaveResult.SAVED) "Saved" else result.message)
                             }
                         }
                         true

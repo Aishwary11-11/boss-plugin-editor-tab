@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
 import java.io.File
 
 /**
@@ -32,6 +33,8 @@ class EditorBuffer(
     val editorState: EditorState,
     val language: String,
 ) {
+    internal val saveMutex = Mutex()
+
     private val _changes =
         MutableSharedFlow<BufferChange>(
             replay = 0,

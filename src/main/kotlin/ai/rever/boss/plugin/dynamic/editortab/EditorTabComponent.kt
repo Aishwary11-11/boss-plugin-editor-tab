@@ -383,39 +383,6 @@ class EditorTabComponent(
         }
     }
 
-    /**
-     * Writes [content] and returns the snapshot of what is now on disk, or null if the write
-     * failed.
-     *
-     * Re-baselining the buffer is done here through noteWrittenByUs() rather than by the
-     * caller: every save on this file (editor tab, diff tab, MCP tool) is invisible to the
-     * watcher the same way.
-     *
-     * The write is staged and moved into place rather than made in the file - see
-     * [AtomicFileWrite] for why, and for what that does and does not promise. A failure
-     * leaves the file exactly as it was, and since this returns null for it, the document
-     * stays modified, the buffer keeps its baseline, and persistDocument shows the error.
-     */
-    private fun saveFile(content: String): DiskSnapshot? {
-        if (filePath.isEmpty()) return null
-
-        return try {
-            val file = File(filePath)
-            // Create parent directories if they don't exist (matches bundled editor)
-            file.parentFile?.mkdirs()
-            AtomicFileWrite.writeText(file, content)
-            // SHARED bookkeeping, so the watcher does not report our own write -
-            // and so a save made here is seen by every other viewport on this buffer.
-            // After the write, never before: on failure the watcher must still treat
-            // whatever is on disk as somebody else's.
-            EditorBufferRegistry.find(filePath)?.noteWrittenByUs()
-            snapshotFile()
-        } catch (e: Exception) {
-            System.err.println("[EditorTabComponent] Failed to save file '$filePath': ${e.message}")
-            null
-        }
-    }
-
     /** One stat of the open file: cheap, and the only thing the poll does while nothing moves. */
     private fun snapshotFile(): DiskSnapshot {
         if (filePath.isEmpty()) return DiskSnapshot.MISSING
@@ -432,19 +399,6 @@ class EditorTabComponent(
             // file was deleted, so report no news rather than inventing a deletion.
             System.err.println("[EditorTabComponent] Error checking file '$filePath': ${e.message}")
             largeFileBaseline
-        }
-    }
-
-    /** The file's current bytes, or null if it is gone or unreadable. */
-    private fun readDiskText(): String? {
-        if (filePath.isEmpty()) return null
-
-        return try {
-            val file = File(filePath)
-            if (!file.exists()) null else file.readText()
-        } catch (e: Exception) {
-            System.err.println("[EditorTabComponent] Error reading file '$filePath': ${e.message}")
-            null
         }
     }
 
@@ -911,7 +865,7 @@ class EditorTabComponent(
                         "changed on disk - reopen to refresh"
                     } else {
                         // Deliberately no emptying of the buffer: the text on screen may be
-                        // the only copy left. saveFile recreates parent directories, so
+                        // the only copy left. The protected writer recreates parent directories, so
                         // Cmd+S puts it back.
                         "deleted on disk"
                     }
@@ -924,40 +878,14 @@ class EditorTabComponent(
             if (isLargeFile || filePath.isEmpty()) return
             if (!editorState.isModified.value) return
 
-            // Never write over something another program put there. This matters most for
-            // auto save, which fires on a timer the user is not thinking about: without the
-            // check, a debounce landing after vim wrote the file would erase that write with
-            // no prompt and no trace.
-            //
-            // Not gated on the reload setting. That setting is about whether the tab follows
-            // the file; this is about not destroying someone else's work on the way out, which
-            // is worth asking about however the tab is configured.
-            //
-            // Asked of the BUFFER's baseline, not a tab-private copy: the watcher owns
-            // external changes and re-baselines it after every verdict, so a save right
-            // after a watcher reload cannot re-report the same change. A real conflict is
-            // surfaced through the same bar the watcher uses - one decision surface, not a
-            // second dialog.
-            buffer?.let { b ->
-                val current = withContext(Dispatchers.IO) { signatureOf(File(filePath)) }
-                if (current != b.knownSignature && current.exists) {
-                    val diskText = withContext(Dispatchers.IO) { readDiskText() }
-                    if (diskText != null && diskText != editorState.document.getText()) {
-                        b.setExternalState(ExternalState.CONFLICT)
-                        return
-                    }
-                }
-            }
-
             isSaving = true
             saveError = null
-            val content = editorState.document.getText()
-            if (withContext(Dispatchers.IO) { saveFile(content) } != null) {
-                editorState.markAsSaved()
-            } else {
-                saveError = "Failed to save file"
+            try {
+                val result = buffer?.let { saveEditorDocument(it) } ?: DocumentSaveResult.UNAVAILABLE
+                saveError = result.message
+            } finally {
+                isSaving = false
             }
-            isSaving = false
         }
 
         // Auto save. Keyed on editVersion, so each keystroke cancels the pending timer and
@@ -1190,11 +1118,15 @@ class EditorTabComponent(
                     onReload = {
                         // Re-baselines the buffer's own signature; the tab keeps no
                         // copy anymore, so there is nothing else to update.
-                        ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
-                        diskNotice = null
+                        scope.launch {
+                            ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
+                            diskNotice = null
+                        }
                     },
                     onKeepMine = {
-                        ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
+                        scope.launch {
+                            ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
+                        }
                     },
                 )
             }

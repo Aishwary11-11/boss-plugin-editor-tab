@@ -6,8 +6,18 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.FileSystemException
+import org.junit.Assume
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermissions
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.AclFileAttributeView
+import java.nio.file.attribute.AclEntry
+import java.nio.file.attribute.AclEntryType
+import java.nio.file.attribute.AclEntryPermission
+import java.nio.file.attribute.DosFileAttributeView
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -44,6 +54,26 @@ class AtomicFileWriteTest {
     private fun file(name: String) = File(dir, name)
 
     private fun leftovers() = dir.listFiles()?.filter { it.name.contains(".boss-save") }.orEmpty()
+
+    private fun <T : Any> requireCapability(value: T?, description: String): T {
+        Assume.assumeTrue(description, value != null)
+        return value!!
+    }
+
+    private fun createSymlink(link: Path, target: Path) {
+        try {
+            Files.createSymbolicLink(link, target)
+        } catch (failure: UnsupportedOperationException) {
+            Assume.assumeNoException("Symlinks are unsupported by this filesystem", failure)
+        } catch (failure: FileSystemException) {
+            if (System.getProperty("os.name").startsWith("Windows") &&
+                failure.reason.orEmpty().contains("privilege", ignoreCase = true)) {
+                Assume.assumeNoException("This Windows account lacks symlink privileges", failure)
+            } else {
+                throw failure
+            }
+        }
+    }
 
     /** Writes [half] of the content and then fails, as a full disk would. */
     private fun failAfterPartialWrite(half: Int): (Path, String) -> Unit = { staging, content ->
@@ -158,8 +188,8 @@ class AtomicFileWriteTest {
     @Test
     fun `an unwritable directory fails the save rather than the file`() {
         val posix = runCatching { Files.getPosixFilePermissions(dir.toPath()) }.isSuccess
-        if (!posix) return // Windows: no POSIX mode to take away.
-        if (System.getProperty("user.name") == "root") return // root ignores the mode.
+        Assume.assumeTrue("POSIX permissions are unsupported", posix)
+        Assume.assumeTrue("Root bypasses POSIX write permissions", System.getProperty("user.name") != "root")
         val target = file("doc.txt")
         target.writeText("intact")
         Files.setPosixFilePermissions(dir.toPath(), PosixFilePermissions.fromString("r-xr-xr-x"))
@@ -184,7 +214,7 @@ class AtomicFileWriteTest {
         val posix = runCatching {
             Files.setPosixFilePermissions(target.toPath(), PosixFilePermissions.fromString("rw-r--r--"))
         }.isSuccess
-        if (!posix) return
+        Assume.assumeTrue("POSIX permissions are unsupported", posix)
 
         AtomicFileWrite.writeText(target, "second")
 
@@ -195,14 +225,82 @@ class AtomicFileWriteTest {
     }
 
     @Test
+    fun `the destination keeps its POSIX owner and group`() {
+        val target = file("ownership.txt").also { it.writeText("first") }
+        val view = requireCapability(Files.getFileAttributeView(target.toPath(), PosixFileAttributeView::class.java), "POSIX metadata is unsupported")
+        val original = view.readAttributes()
+
+        AtomicFileWrite.writeText(target, "second") { staging, content ->
+            val staged = Files.readAttributes(staging, java.nio.file.attribute.PosixFileAttributes::class.java)
+            assertEquals(original.owner(), staged.owner())
+            assertEquals(original.group(), staged.group())
+            assertEquals(original.permissions(), staged.permissions(), "access mode must precede content writing")
+            Files.writeString(staging, content)
+        }
+
+        val replaced = view.readAttributes()
+        assertEquals(original.owner(), replaced.owner())
+        assertEquals(original.group(), replaced.group())
+        assertEquals(original.permissions(), replaced.permissions())
+    }
+
+    @Test
+    fun `the destination keeps its supported ACL and owner`() {
+        val target = file("acl.txt").also { it.writeText("first") }
+        val view = requireCapability(Files.getFileAttributeView(target.toPath(), AclFileAttributeView::class.java), "ACL metadata is unsupported")
+        val originalOwner = view.owner
+        // An explicit non-inherited grant distinguishes this file from a new sibling's
+        // inherited ACL, so merely keeping the staging defaults cannot pass the test.
+        val explicitGrant = AclEntry.newBuilder()
+            .setType(AclEntryType.ALLOW)
+            .setPrincipal(originalOwner)
+            .setPermissions(AclEntryPermission.READ_DATA, AclEntryPermission.WRITE_DATA,
+                AclEntryPermission.APPEND_DATA, AclEntryPermission.READ_ATTRIBUTES,
+                AclEntryPermission.WRITE_ATTRIBUTES, AclEntryPermission.READ_ACL,
+                AclEntryPermission.WRITE_ACL, AclEntryPermission.SYNCHRONIZE,
+                AclEntryPermission.DELETE)
+            .build()
+        view.acl = listOf(explicitGrant) + view.acl
+        val originalAcl = view.acl.toList()
+
+        AtomicFileWrite.writeText(target, "second") { staging, content ->
+            val stageView = Files.getFileAttributeView(staging, AclFileAttributeView::class.java)
+            assertEquals(originalAcl, stageView.acl, "access policy must precede content writing")
+            assertEquals(originalOwner, stageView.owner)
+            Files.writeString(staging, content)
+        }
+
+        assertEquals(originalAcl, view.acl)
+        assertEquals(originalOwner, view.owner)
+    }
+
+    @Test
+    fun `the destination keeps its supported DOS flags`() {
+        val target = file("flags.txt").also { it.writeText("first") }
+        val view = requireCapability(Files.getFileAttributeView(target.toPath(), DosFileAttributeView::class.java), "DOS metadata is unsupported")
+        view.setHidden(true)
+        view.setSystem(true)
+        view.setArchive(false)
+        val original = view.readAttributes()
+
+        AtomicFileWrite.writeText(target, "second")
+
+        val replaced = view.readAttributes()
+        assertEquals(original.isHidden, replaced.isHidden)
+        assertEquals(original.isSystem, replaced.isSystem)
+        assertEquals(original.isArchive, replaced.isArchive)
+        assertEquals(original.isReadOnly, replaced.isReadOnly)
+        assertEquals("second", target.readText())
+    }
+
+    @Test
     fun `a symlink is written through, not replaced`() {
         // Dotfiles and shared config are routinely symlinked into a project. Moving a
         // staging file over the link would detach it from whatever it pointed at, and
         // the next save would write somewhere the rest of the system is not reading.
         val real = file("real.txt").also { it.writeText("first") }
         val link = File(dir, "link.txt")
-        val linked = runCatching { Files.createSymbolicLink(link.toPath(), real.toPath()) }.isSuccess
-        if (!linked) return // Windows without developer mode.
+        createSymlink(link.toPath(), real.toPath())
 
         AtomicFileWrite.writeText(link, "second")
 
@@ -212,15 +310,93 @@ class AtomicFileWriteTest {
     }
 
     @Test
+    fun `a read-only destination is not bypassed by replacing its directory entry`() {
+        Assume.assumeTrue("Root bypasses POSIX write permissions", System.getProperty("user.name") != "root")
+        val target = file("read-only.txt").also { it.writeText("original") }
+        requireCapability(Files.getFileAttributeView(target.toPath(), PosixFileAttributeView::class.java), "POSIX permissions are unsupported")
+        Files.setPosixFilePermissions(target.toPath(), PosixFilePermissions.fromString("r--r--r--"))
+        try {
+            assertFailsWith<IOException> { AtomicFileWrite.writeText(target, "replacement") }
+            assertEquals("original", target.readText())
+            assertTrue(leftovers().isEmpty())
+        } finally {
+            Files.setPosixFilePermissions(target.toPath(), PosixFilePermissions.fromString("rw-------"))
+        }
+    }
+
+    @Test
+    fun `a new file follows the same umask as an ordinary created file`() {
+        val expected = file("reference.txt")
+        Assume.assumeTrue("POSIX permissions are unsupported",
+            Files.getFileStore(dir.toPath()).supportsFileAttributeView(PosixFileAttributeView::class.java))
+        Files.createFile(expected.toPath(),
+            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-rw-rw-")))
+        val target = file("new-mode.txt")
+
+        AtomicFileWrite.writeText(target, "new document")
+
+        assertEquals(Files.getPosixFilePermissions(expected.toPath()), Files.getPosixFilePermissions(target.toPath()))
+    }
+
+    @Test
+    fun `a directory destination is rejected without staging or removing it`() {
+        val target = file("directory").also { it.mkdir() }
+        val child = File(target, "keep.txt").also { it.writeText("intact") }
+
+        assertFailsWith<IOException> { AtomicFileWrite.writeText(target, "replacement") }
+
+        assertEquals("intact", child.readText())
+        assertTrue(leftovers().isEmpty())
+    }
+
+    @Test
+    fun `a dangling relative symlink creates its target without replacing the link`() {
+        val real = file("not-yet-created.txt")
+        val link = file("link.txt")
+        createSymlink(link.toPath(), Path.of(real.name))
+
+        AtomicFileWrite.writeText(link, "new document")
+
+        assertTrue(Files.isSymbolicLink(link.toPath()))
+        assertEquals("new document", real.readText())
+        assertTrue(leftovers().isEmpty())
+    }
+
+    @Test
+    fun `a symlink cycle fails without destroying either link`() {
+        val first = file("first-link")
+        val second = file("second-link")
+        createSymlink(first.toPath(), Path.of(second.name))
+        Files.createSymbolicLink(second.toPath(), Path.of(first.name))
+
+        assertFailsWith<IOException> { AtomicFileWrite.writeText(first, "replacement") }
+
+        assertTrue(Files.isSymbolicLink(first.toPath()))
+        assertTrue(Files.isSymbolicLink(second.toPath()))
+        assertTrue(leftovers().isEmpty())
+    }
+
+    @Test
+    fun `a long valid filename does not overflow the staging filename`() {
+        val target = file("a".repeat(240) + ".txt")
+        target.writeText("original")
+
+        AtomicFileWrite.writeText(target, "replacement")
+
+        assertEquals("replacement", target.readText())
+        assertTrue(leftovers().isEmpty())
+    }
+
+    @Test
     fun `the destination is replaced, not truncated in place`() {
         // Stated as something exact rather than as a race to lose: an in-place write
         // keeps the inode, so a reader can observe the file mid-write. An atomic move
         // installs a new one, which is why no reader ever sees a partial document.
         val target = file("doc.txt")
         target.writeText("first")
-        val before = runCatching {
-            Files.readAttributes(target.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java).fileKey()
-        }.getOrNull() ?: return // Windows has no file key.
+        val before = requireCapability(
+            Files.readAttributes(target.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java).fileKey(),
+            "Filesystem identity keys are unsupported")
 
         AtomicFileWrite.writeText(target, "second")
 
@@ -244,22 +420,31 @@ class AtomicFileWriteTest {
         val slow = "A".repeat(4_000)
         val quick = "B".repeat(10)
 
+        val failure = AtomicReference<Throwable?>()
         val slowSave = Thread {
-            AtomicFileWrite.writeText(target, slow) { staging, content ->
-                FileChannel.open(staging, StandardOpenOption.WRITE).use { channel ->
-                    channel.write(ByteBuffer.wrap(content.toByteArray(Charsets.UTF_8)))
+            try {
+                AtomicFileWrite.writeText(target, slow) { staging, content ->
+                    FileChannel.open(staging, StandardOpenOption.WRITE).use { channel ->
+                        channel.write(ByteBuffer.wrap(content.toByteArray(Charsets.UTF_8)))
+                    }
+                    // Staged but not yet installed: the whole window this is about.
+                    staged.countDown()
+                    assertTrue(otherDone.await(5, TimeUnit.SECONDS), "the other save did not finish")
                 }
-                // Staged but not yet installed: the whole window this is about.
-                staged.countDown()
-                otherDone.await()
+            } catch (error: Throwable) {
+                failure.set(error)
             }
         }
         slowSave.start()
-        staged.await()
-
-        AtomicFileWrite.writeText(target, quick)
-        otherDone.countDown()
-        slowSave.join()
+        try {
+            assertTrue(staged.await(5, TimeUnit.SECONDS), "the first save never staged")
+            AtomicFileWrite.writeText(target, quick)
+        } finally {
+            otherDone.countDown()
+        }
+        slowSave.join(5_000)
+        assertTrue(!slowSave.isAlive, "the save thread did not terminate")
+        failure.get()?.let { throw AssertionError("the overlapping save failed", it) }
 
         // The slow save moves last, so it wins outright. What must not happen is its
         // staging carrying the other save's bytes, or having been consumed by it.
@@ -275,10 +460,21 @@ class AtomicFileWriteTest {
         target.writeText("first")
         val contents = (1..24).map { "version $it".repeat(200) }
 
+        val failure = AtomicReference<Throwable?>()
         val threads = contents.map { content ->
-            Thread { AtomicFileWrite.writeText(target, content) }.also { it.start() }
+            Thread {
+                try {
+                    AtomicFileWrite.writeText(target, content)
+                } catch (error: Throwable) {
+                    failure.compareAndSet(null, error)
+                }
+            }.also { it.start() }
         }
-        threads.forEach { it.join() }
+        threads.forEach {
+            it.join(5_000)
+            assertTrue(!it.isAlive, "a save thread did not terminate")
+        }
+        failure.get()?.let { throw AssertionError("an overlapping save failed", it) }
 
         assertTrue(target.readText() in contents, "a save landed with mixed content")
         assertTrue(leftovers().isEmpty(), "left staging files behind: ${leftovers().map { it.name }}")
