@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import java.io.File
+import org.junit.Assume
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -85,12 +86,12 @@ class LspNavigationTest {
 
     @Test
     fun `file uri becomes an absolute path`() {
-        assertEquals("/tmp/a.ts", LspNavigation.uriToPath("file:///tmp/a.ts"))
+        assertEquals(File("/tmp/a.ts").absolutePath, LspNavigation.uriToPath("file:///tmp/a.ts"))
     }
 
     @Test
     fun `percent escapes are decoded`() {
-        assertEquals("/tmp/a b.ts", LspNavigation.uriToPath("file:///tmp/a%20b.ts"))
+        assertEquals(File("/tmp/a b.ts").absolutePath, LspNavigation.uriToPath("file:///tmp/a%20b.ts"))
     }
 
     @Test
@@ -103,18 +104,20 @@ class LspNavigationTest {
 
     @Test
     fun `canonical server target is mapped back through the requested root alias`() {
-        assertEquals(
-            "/workspace-link/src/main.ts",
-            LspNavigation.restoreRootAlias(
-                targetPath = "/canonical/workspace/src/main.ts",
-                canonicalRoot = "/canonical/workspace",
-                requestedRoot = "/workspace-link",
-            ),
-        )
-        assertEquals(
-            "/other/main.ts",
-            LspNavigation.restoreRootAlias("/other/main.ts", "/canonical/workspace", "/workspace-link"),
-        )
+        val directory = createTempDir()
+        try {
+            val canonical = File(directory, "canonical/workspace")
+            val requested = File(directory, "workspace-link")
+            val target = File(canonical, "src/main.ts")
+            assertEquals(
+                File(requested, "src/main.ts").absolutePath,
+                LspNavigation.restoreRootAlias(target.path, canonical.path, requested.path),
+            )
+            val outside = File(directory, "other/main.ts").absolutePath
+            assertEquals(outside, LspNavigation.restoreRootAlias(outside, canonical.path, requested.path))
+        } finally {
+            directory.deleteRecursively()
+        }
     }
 
     @Test
@@ -159,8 +162,16 @@ class LspNavigationTest {
     @Test
     fun `a non-executable file is not a match`() {
         val dir = createTempDir()
-        File(dir, "not-exec").apply { writeText("x"); setExecutable(false) }
-        assertNull(LspNavigation.findOnPath("not-exec", dir.absolutePath))
+        try {
+            val file = File(dir, "not-exec").apply { writeText("x") }
+            Assume.assumeTrue(
+                "filesystem cannot represent a non-executable regular file",
+                file.setExecutable(false) && !file.canExecute(),
+            )
+            assertNull(LspNavigation.findOnPath("not-exec", dir.absolutePath))
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     @Test

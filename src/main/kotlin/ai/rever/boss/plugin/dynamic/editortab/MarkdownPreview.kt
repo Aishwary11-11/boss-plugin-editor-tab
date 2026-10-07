@@ -296,10 +296,11 @@ private fun routePreviewLink(url: String, allowedRoot: String?, onOpenLocalFile:
  * `java.io.File(URI)` rejects any URI carrying either component, so without this a
  * cross-file heading link would be refused rather than opened.
  *
- * Both sides of the containment check are canonical. URL resolution already collapses
+ * Both sides of the containment check use NIO real paths. URL resolution already collapses
  * `..` before the click reaches Kotlin, so that part is insurance — but resolving
  * symlinks is not: an in-repo symlink pointing at `~/.ssh/id_rsa` is inside the project
- * by path and outside it by target, and only `canonicalPath` can tell the difference.
+ * by path and outside it by target. `File.canonicalFile` does not resolve Windows
+ * symlinks reliably; `Path.toRealPath` resolves the existing target and root.
  */
 private fun localFileFor(url: String, allowedRoot: String?): String? {
     if (allowedRoot.isNullOrBlank()) return null
@@ -319,29 +320,14 @@ private fun localFileFor(url: String, allowedRoot: String?): String? {
         }
     }
     return try {
-        val file = java.io.File(bare).canonicalFile
-        val root = java.io.File(allowedRoot).canonicalFile
-        file.takeIf { it.isFile && it.isWithin(root) }?.path
+        val file = java.io.File(bare).toPath().toRealPath()
+        val root = java.io.File(allowedRoot).toPath().toRealPath()
+        file.takeIf { Files.isRegularFile(it) && Files.isDirectory(root) && it.startsWith(root) }?.toString()
     } catch (_: Exception) {
         null
     }
 }
 
-/**
- * Whether this file sits inside [root].
- *
- * Walks parents rather than comparing path strings: a `startsWith` on the path text
- * accepts `/project-secrets/x` for a root of `/project`, since the prefix matches
- * before the separator does.
- */
-private fun java.io.File.isWithin(root: java.io.File): Boolean {
-    var cur: java.io.File? = parentFile
-    while (cur != null) {
-        if (cur == root) return true
-        cur = cur.parentFile
-    }
-    return false
-}
 
 private fun openInSystemBrowser(url: String) {
     if (!isBrowsableLink(url)) {

@@ -46,6 +46,12 @@ The editor supports syntax highlighting for many languages including:
 - SQL
 - And many more...
 
+## Saving files
+
+Manual save, autosave, and editable diff-pane saves share a protected local save
+transaction. See [protected saves](docs/protected-saves.md) for failure behavior
+and filesystem limits.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
