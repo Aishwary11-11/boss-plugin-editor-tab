@@ -51,6 +51,22 @@ class ExternalReloadRaceTest {
         }
 
     @Test
+    fun `a manually reloaded buffer invalidates an older queued disk reload`() =
+        runBlocking {
+            race { buffer, watcher, finish ->
+                java.io.File(buffer.path).writeText("newer external content")
+                watcher.resolveByReloading(buffer)
+                val acceptedSignature = buffer.knownSignature
+                finish()
+
+                assertEquals("newer external content", buffer.content)
+                assertEquals(acceptedSignature, buffer.knownSignature)
+                assertFalse(buffer.editorState.isModified.value)
+                assertEquals(ExternalState.IN_SYNC, buffer.externalState.value)
+            }
+        }
+
+    @Test
     fun `keep mine invalidates a queued reload even without a document edit`() =
         runBlocking {
             race { buffer, watcher, finish ->
