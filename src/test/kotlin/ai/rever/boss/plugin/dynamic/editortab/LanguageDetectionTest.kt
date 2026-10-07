@@ -166,7 +166,7 @@ class LanguageDetectionTest {
      *
      * `detect` maps `.r` to `r` and `lexerFor` has no branch for it, so an R file is named as R
      * and then highlights as nothing. It cannot be fixed by adding a branch: the bundled
-     * `bosseditor-compose-desktop:1.0.12` ships 41 lexers and none of them is an R lexer.
+     * `bosseditor-compose-desktop:1.0.26` ships 41 lexers and none of them is an R lexer.
      *
      * This asserts the current behaviour, not the desired one. When an R lexer ships, this test
      * fails, which is the point: it is the reminder to wire it up and move `r` into the list above.
