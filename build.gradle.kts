@@ -32,7 +32,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // 1.6.6: auto-bumped bundled BossEditor to 1.0.26
 // (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.26).
 // 1.6.9: Compose-only minimap/font boundary supports BOSS 9.5.25.
-version = "1.6.13"
+version = "1.6.14"
 
 java {
     toolchain {
