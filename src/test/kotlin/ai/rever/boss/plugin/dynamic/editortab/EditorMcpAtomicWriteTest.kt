@@ -244,7 +244,7 @@ class EditorMcpAtomicWriteTest {
     }
 
     @Test
-    fun `symlink parent dot dot semantics are followed before matching the save lock`() = runBlocking {
+    fun `platform symlink parent dot dot semantics select the correct save lock`() = runBlocking {
         scratch { directory ->
             val project = File(directory, "project").apply { mkdirs() }
             val actualParent = File(directory, "other").apply { mkdirs() }
@@ -253,8 +253,20 @@ class EditorMcpAtomicWriteTest {
             val decoy = File(project, "file.txt").apply { writeText("unrelated") }
             val link = File(project, "entry")
             createSymlink(link, deep)
-            verifyAliasWaits(target, File(link, "../file.txt").path, listOf(target.path))
-            assertEquals("unrelated", decoy.readText(), "the original path was lexically normalized before following its link")
+            val argument = File(link, "../file.txt")
+            // Win32 resolves .. before following a directory link; POSIX follows
+            // the link first. An ordinary read establishes the actual destination
+            // independently of our atomic resolver and buffer identity lookup.
+            val before = Files.readString(argument.toPath())
+            val destination = when (before) {
+                "original" -> target
+                "unrelated" -> decoy
+                else -> error("The fixture path does not reach either expected file")
+            }
+            val untouched = if (destination == target) decoy else target
+            val untouchedBefore = untouched.readText()
+            verifyAliasWaits(destination, argument.path, listOf(destination.path))
+            assertEquals(untouchedBefore, untouched.readText(), "the write reached a different file from an ordinary read")
         }
     }
 
