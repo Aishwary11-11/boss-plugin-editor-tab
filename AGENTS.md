@@ -87,3 +87,10 @@ Pushes to `main` trigger the release workflow which:
 3. Publishes to the BOSS Plugin Store
 
 The workflow is defined in `.github/workflows/build.yml` and delegates to the shared workflow in `risa-labs-inc/BossConsole-Releases`.
+
+### Temporary BossEditor compatibility overrides
+
+The pinned 1.0.26 dependency has minimap and FontUtils source overrides under
+`src/main/kotlin/ai/rever/bosseditor/` for BOSS 9.5.25. Review the version guard,
+packaging exclusions, and compatibility tests whenever updating BossEditor.
+Remove these overrides after adopting the upstream rendering fix (BossEditor #24).
