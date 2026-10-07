@@ -120,7 +120,13 @@ internal object LanguageDetection {
         "php" -> "php"
         "pl", "pm" -> "perl"
         "lua" -> "lua"
-        "sh", "bash", "zsh" -> "shell"
+        // `bash`, not `shell`, to match the host's canonical table
+        // (`plugin-platform/plugin-language-types`'s `LanguageIds`). BossConsole#75 tracks this
+        // mapping existing in several places that disagreed; this was the last disagreement
+        // between that table and this one. Both spellings resolve to `ShellLexer` in [lexerFor]
+        // below, so the same `.sh` file now gets the same id whichever route opens it, and the
+        // lexer that runs is unchanged.
+        "sh", "bash", "zsh" -> "bash"
         "yml", "yaml" -> "yaml"
         "sql" -> "sql"
         "r" -> "r"
