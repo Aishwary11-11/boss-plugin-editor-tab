@@ -545,19 +545,20 @@ internal class EditorTabMcpToolProvider(
         false
     }
 
-    /** Follow existing symlink/.. semantics before resolving the absent final filename. */
+    /** Use the writer's link resolution, including dangling final links and cycle checks. */
     private fun realWriteLocation(path: Path): Path? = try {
-        path.toRealPath()
-    } catch (cancelled: CancellationException) {
-        throw cancelled
-    } catch (_: Exception) {
+        val target = AtomicFileWrite.resolveLink(path)
         try {
-            path.parent?.toRealPath()?.resolve(path.fileName)
+            target.toRealPath()
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            null
+            target.parent?.toRealPath()?.resolve(target.fileName)
         }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
     }
 
     private fun unavailable(): McpToolResult =

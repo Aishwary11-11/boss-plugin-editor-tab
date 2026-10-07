@@ -219,6 +219,31 @@ class EditorMcpAtomicWriteTest {
     }
 
     @Test
+    fun `a dangling final symlink waits for the absent target buffer save lock`() = runBlocking {
+        scratch { directory ->
+            val target = File(directory, "new-file.txt")
+            val link = File(directory, "alias.txt")
+            createSymlink(link, target)
+            verifyAliasWaits(target, link.path, listOf(target.path))
+            assertTrue(Files.isSymbolicLink(link.toPath()))
+        }
+    }
+
+    @Test
+    fun `a relative dangling symlink chain waits for the absent target buffer save lock`() = runBlocking {
+        scratch { directory ->
+            val target = File(directory, "new-file.txt")
+            val inner = File(directory, "inner.txt")
+            val outer = File(directory, "outer.txt")
+            createSymlink(inner, File(target.name))
+            createSymlink(outer, File(inner.name))
+            verifyAliasWaits(target, outer.path, listOf(target.path))
+            assertTrue(Files.isSymbolicLink(inner.toPath()))
+            assertTrue(Files.isSymbolicLink(outer.toPath()))
+        }
+    }
+
+    @Test
     fun `symlink parent dot dot semantics are followed before matching the save lock`() = runBlocking {
         scratch { directory ->
             val project = File(directory, "project").apply { mkdirs() }

@@ -123,7 +123,7 @@ internal object AtomicFileWrite {
     }
 
     /** Resolve final-component links even when their target does not exist yet. */
-    private fun resolveLink(path: Path): Path {
+    internal fun resolveLink(path: Path): Path {
         var target = path
         val seen = mutableSetOf<Path>()
         while (Files.isSymbolicLink(target)) {

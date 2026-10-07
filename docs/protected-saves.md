@@ -106,4 +106,5 @@ permission, concurrency, and cleanup behavior separately.
 `EditorMcpAtomicWriteTest` calls the actual MCP handler and checks old/missing
 providers, partial production staging failures, UTF-8/empty writes, argument and
 permission contracts, I/O dispatch, live-buffer transactions, and existing or
-absent targets reached through dot paths, symlinks, and symlink/.. traversal.
+absent targets reached through dot paths, symlinks, dangling-link chains, and
+symlink/.. traversal.
