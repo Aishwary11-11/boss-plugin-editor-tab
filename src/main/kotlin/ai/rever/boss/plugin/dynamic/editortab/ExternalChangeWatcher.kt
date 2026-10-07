@@ -175,6 +175,7 @@ internal class ExternalChangeWatcher(
     internal suspend fun checkOnce(buffer: EditorBuffer) {
         val file = File(buffer.path)
         val known = buffer.knownSignature
+        val version = buffer.version
         val current = withContext(Dispatchers.IO) { signatureOf(file) }
         if (current == known && current.exists) return
 
@@ -182,51 +183,57 @@ internal class ExternalChangeWatcher(
         val diskText = withContext(Dispatchers.IO) {
             if (current.exists) runCatching { file.readText() }.getOrNull() else null
         }
-        // Compose-backed document state, both of them: read on Main (this
-        // sweep's own dispatcher) and passed to the pure policy as values.
-        val bufferText = buffer.content
-        val verdict = ExternalChangePolicy.decide(
-            known = known,
-            current = current,
-            diskText = diskText,
-            bufferText = bufferText,
-            hasUnsavedChanges = buffer.editorState.isModified.value,
-        )
+        withContext(applyOn) {
+            // Disk I/O and dispatcher hops suspend. A save, edit or conflict resolution
+            // may have superseded this observation while it was in flight. Leave its
+            // state untouched and let the next poll evaluate a fresh observation.
+            if (buffer.knownSignature != known || buffer.version != version) return@withContext
 
-        when (verdict) {
-            ExternalChangePolicy.Verdict.NONE -> {
-                // Take the new signature so an unchanged file is not re-read on
-                // every tick.
-                buffer.knownSignature = current
-            }
+            // Decide and apply without suspending, on the same dispatcher as user edits.
+            val bufferText = buffer.content
+            val verdict = ExternalChangePolicy.decide(
+                known = known,
+                current = current,
+                diskText = diskText,
+                bufferText = bufferText,
+                hasUnsavedChanges = buffer.editorState.isModified.value,
+            )
 
-            ExternalChangePolicy.Verdict.DELETED -> {
-                buffer.knownSignature = current
-                buffer.setExternalState(ExternalState.DELETED)
-            }
-
-            ExternalChangePolicy.Verdict.CONFLICT -> {
-                // Note NOTHING else: the buffer keeps the user's edits and the
-                // UI asks. Deliberately does not update knownSignature, so the
-                // conflict survives until it is resolved one way or the other.
-                buffer.setExternalState(ExternalState.CONFLICT)
-            }
-
-            ExternalChangePolicy.Verdict.RELOAD -> {
-                val text = diskText ?: return
-                if (!autoReload()) {
-                    // Auto-reload is off in the settings: apply nothing, and
-                    // adopt no signature - the change stays live news, so the
-                    // very next tick after the setting is switched back on
-                    // re-applies it (the same re-detection the old per-tab
-                    // poll did on re-enable). While it stays off the cost is
-                    // one re-read of the file per tick; large files keep no
-                    // buffer, so this is bounded by a normal file's size.
-                    return
+            when (verdict) {
+                ExternalChangePolicy.Verdict.NONE -> {
+                    // Take the new signature so an unchanged file is not re-read on
+                    // every tick.
+                    buffer.knownSignature = current
                 }
-                withContext(applyOn) { applyReload(buffer, text) }
-                buffer.knownSignature = current
-                buffer.setExternalState(ExternalState.IN_SYNC)
+
+                ExternalChangePolicy.Verdict.DELETED -> {
+                    buffer.knownSignature = current
+                    buffer.setExternalState(ExternalState.DELETED)
+                }
+
+                ExternalChangePolicy.Verdict.CONFLICT -> {
+                    // Note NOTHING else: the buffer keeps the user's edits and the
+                    // UI asks. Deliberately does not update knownSignature, so the
+                    // conflict survives until it is resolved one way or the other.
+                    buffer.setExternalState(ExternalState.CONFLICT)
+                }
+
+                ExternalChangePolicy.Verdict.RELOAD -> {
+                    val text = diskText ?: return@withContext
+                    if (!autoReload()) {
+                        // Auto-reload is off in the settings: apply nothing, and
+                        // adopt no signature - the change stays live news, so the
+                        // very next tick after the setting is switched back on
+                        // re-applies it (the same re-detection the old per-tab
+                        // poll did on re-enable). While it stays off the cost is
+                        // one re-read of the file per tick; large files keep no
+                        // buffer, so this is bounded by a normal file's size.
+                        return@withContext
+                    }
+                    applyReload(buffer, text)
+                    buffer.knownSignature = current
+                    buffer.setExternalState(ExternalState.IN_SYNC)
+                }
             }
         }
     }
