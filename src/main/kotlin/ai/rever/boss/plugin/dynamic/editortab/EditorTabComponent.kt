@@ -8,8 +8,9 @@ import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.boss.plugin.ui.ContextMenuItemData
 import ai.rever.bosseditor.compose.BossEditor
+import ai.rever.bosseditor.compose.EditorHover
 import ai.rever.bosseditor.compose.NavigationResolveResult
-import ai.rever.bosseditor.config.BossDirectories
+import ai.rever.bosseditor.settings.EditorSettings
 import ai.rever.bosseditor.features.UsagesPopup
 import ai.rever.bosseditor.features.UsagesPopupState
 import ai.rever.bosseditor.features.NavigationFeedbackPopup
@@ -143,8 +144,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import java.io.File
 import kotlin.reflect.full.memberProperties
 
@@ -413,7 +412,7 @@ class EditorTabComponent(
     @Composable
     override fun Content() {
         BossTheme {
-            val settings by PluginEditorSettings.settings.collectAsState()
+            val settings by editorSettingsFlow().collectAsState()
             ApplyHostChromeToEditor()
             val hostTheme = rememberHostEditorTheme()
             val editorTheme = remember(settings.followHostTheme, settings.themeName, hostTheme) {
@@ -430,7 +429,7 @@ class EditorTabComponent(
     }
 
     @Composable
-    private fun EditorTabContent(settings: PluginEditorSettingsData) {
+    private fun EditorTabContent(settings: EditorSettings) {
         val scope = rememberCoroutineScope()
 
         // Settings arrive from Content(), which already collects them to resolve the
@@ -864,7 +863,7 @@ class EditorTabComponent(
                         "changed on disk - reopen to refresh"
                     } else {
                         // Deliberately no emptying of the buffer: the text on screen may be
-                        // the only copy left. The host writer recreates parent directories, so
+                        // the only copy left. The protected writer recreates parent directories, so
                         // Cmd+S puts it back.
                         "deleted on disk"
                     }
@@ -880,13 +879,7 @@ class EditorTabComponent(
             isSaving = true
             saveError = null
             try {
-                val result =
-                    buffer?.let {
-                        saveEditorDocument(
-                            it,
-                            context.editorContentProvider?.let { provider -> provider::writeFileContent },
-                        )
-                    } ?: DocumentSaveResult.UNAVAILABLE
+                val result = buffer?.let { saveEditorDocument(it) } ?: DocumentSaveResult.UNAVAILABLE
                 saveError = result.message
             } finally {
                 isSaving = false
@@ -1123,11 +1116,15 @@ class EditorTabComponent(
                     onReload = {
                         // Re-baselines the buffer's own signature; the tab keeps no
                         // copy anymore, so there is nothing else to update.
-                        ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
-                        diskNotice = null
+                        scope.launch {
+                            ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
+                            diskNotice = null
+                        }
                     },
                     onKeepMine = {
-                        ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
+                        scope.launch {
+                            ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
+                        }
                     },
                 )
             }
@@ -1215,6 +1212,30 @@ class EditorTabComponent(
                     // A settings change must replace the resolver in already-open tabs. It also
                     // forces LspSettingsManager's synchronous load before consulting the registry.
                     val lspConfig by LspSettingsManager.instance.configuration.collectAsState()
+                    // One guard for all three LSP call sites (warm-up, navigation, hover) so
+                    // they cannot drift apart: a large file never starts a server, a disabled
+                    // feature answers nothing, and only files whose language has a registered
+                    // server (PSI-only .kt/.kts do not) can be served. Remembered on the
+                    // same keys as the warm-up below, so the registry is consulted only
+                    // when one of them changes - not on every recomposition (caret moves,
+                    // gutter updates).
+                    val lspServesThisFile = remember(filePath, lspConfig, isLargeFile) {
+                        !isLargeFile && lspConfig.enabled && LspNavigation.usesLsp(filePath)
+                    }
+                    // Warm the language server on open (and on every disk reload) so the
+                    // first hover or Cmd+Click answers from a warm server instead of
+                    // paying spawn + initialize + settle on the user's first gesture.
+                    // lspConfig is a key - not just read in the body - so enabling LSP in
+                    // settings with tabs already open re-arms the warm-up; without it the
+                    // first gesture still pays the cold start, the case this exists to fix.
+                    // No-op for files nothing can serve; edits keep in sync because
+                    // every later lookup re-syncs the document.
+                    LaunchedEffect(filePath, contentVersion, lspConfig) {
+                        if (!lspServesThisFile) {
+                            return@LaunchedEffect
+                        }
+                        LspNavigation.shared.warmUp(initialContent, filePath, projectPath)
+                    }
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1266,11 +1287,30 @@ class EditorTabComponent(
                         lspConfig,
                         isLargeFile,
                     ) {
-                        if (isLargeFile || !lspConfig.enabled || !LspNavigation.usesLsp(filePath)) {
+                        if (!lspServesThisFile) {
                             null
                         } else {
                             { content, path, offset ->
                                 LspNavigation.shared.resolveDefinition(content, path, offset, projectPath)
+                            }
+                        }
+                    },
+                    // The pointer counterpart of navigation: rest over a symbol and the
+                    // server's signature/docs appear in a tooltip. Same routing as the
+                    // resolver - PSI has no hover path at all, so only files whose
+                    // language has a registered server can answer, and the same guards
+                    // apply (a large file does not start a server just for the pointer).
+                    hoverProvider = remember<(suspend (String, String, Int) -> EditorHover?)?>(
+                        filePath,
+                        projectPath,
+                        lspConfig,
+                        isLargeFile,
+                    ) {
+                        if (!lspServesThisFile) {
+                            null
+                        } else {
+                            { content, path, offset ->
+                                LspNavigation.shared.resolveHover(content, path, offset, projectPath)
                             }
                         }
                     },
@@ -1829,7 +1869,7 @@ class EditorTabComponent(
             readOnly: Boolean = true,
             showLineNumbers: Boolean = true,
         ) {
-            val settings by PluginEditorSettings.settings.collectAsState()
+            val settings by editorSettingsFlow().collectAsState()
             val language = remember(filePath) { detectLanguage(filePath) }
             val lexer = remember(language) { getLexerForLanguage(language) }
             val tokenCache = remember(lexer, state.document) {
@@ -2078,136 +2118,6 @@ private fun AnchoredAiInlineEditBar(
 
 private val AI_INLINE_MARGIN = 8.dp
 private val AI_INLINE_GAP = 4.dp
-
-// ========== Settings ==========
-
-/**
- * Settings data class matching the bosseditor EditorSettings format exactly, so
- * both halves read and write one editor-settings.json under the BOSS data root.
- */
-@Serializable
-data class PluginEditorSettingsData(
-    // Visual Settings
-    val fontFamily: String? = null,
-    val fontSize: Float = 14f,
-    val lineSpacing: Float = 1.2f,
-    val themeName: String = "Dark",
-    // Whether to take colors from the host theme instead of [themeName]. On by
-    // default, and absent from any settings file written before it existed, so an
-    // existing install starts following the host rather than staying on the "Dark"
-    // its file records. Mirrors bosseditor's EditorSettings.followHostTheme - both
-    // read the same editor-settings.json, so the defaults must agree.
-    val followHostTheme: Boolean = true,
-    val showLineNumbers: Boolean = true,
-    val highlightCurrentLine: Boolean = true,
-    // Behavior Settings
-    val scrollSpeed: Float = 1.5f,
-    val tabSize: Int = 4,
-    val useSpacesForTabs: Boolean = true,
-    val wordWrap: Boolean = false,
-    // Feature Settings
-    val foldingEnabled: Boolean = true,
-    val rainbowBracketsEnabled: Boolean = true,
-    val indentGuidesEnabled: Boolean = true,
-    val bracketMatchingEnabled: Boolean = true,
-    val markOccurrencesEnabled: Boolean = true,
-    // Caret Settings
-    val caretBlinkRate: Int = 530,
-    val caretStyle: String = "line",
-    // Minimap Settings
-    // false, matching bosseditor's own default: with true here the settings panel
-    // showed the toggle off while a tab rendered a minimap anyway. Found by the test
-    // that compares this mirror against EditorSettings property by property.
-    val showMinimap: Boolean = false,
-    val minimapWidth: Int = 80,
-    val minimapUseEditorColors: Boolean = true,
-    val minimapBackgroundColor: String? = null,
-    val minimapForegroundColor: String? = null
-)
-
-/**
- * Reactive settings manager that reads editor-settings.json from the BOSS data
- * root (the same file the bundled bosseditor library writes).
- *
- * Provides a StateFlow that updates when settings change, matching the
- * bundled editor's EditorSettingsManager behavior.
- */
-/**
- * Where the settings live: the same file the bundled bosseditor writes, resolved the
- * same way rather than hardcoded to `~/.boss`. A dev host keeps its data under
- * `~/.boss_debug`, so the settings panel was writing to a file no editor tab watched.
- *
- * [resolve] is a parameter so both branches are testable. The guard matters because
- * this runs during `object` init, where a throw becomes an
- * `ExceptionInInitializerError` that poisons every later read, not just the first -
- * and the fallback is loud because it reinstates exactly the split above.
- */
-internal fun resolveSettingsFile(
-    resolve: (String) -> File = { BossDirectories.resolve(it) },
-): File = runCatching { resolve("editor-settings.json") }
-    .getOrElse { error ->
-        System.err.println("editor-tab: BOSS data root unavailable ($error), using ~/.boss")
-        File(System.getProperty("user.home"), ".boss/editor-settings.json")
-    }
-
-object PluginEditorSettings {
-    private val settingsFile = resolveSettingsFile()
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-    }
-
-    private val _settings = kotlinx.coroutines.flow.MutableStateFlow(loadFromFile())
-    val settings: kotlinx.coroutines.flow.StateFlow<PluginEditorSettingsData> = _settings
-
-    private var lastModified: Long = settingsFile.lastModified()
-
-    private var watcherJob: kotlinx.coroutines.Job? = null
-
-    /**
-     * The 500ms file poll, on a scope the plugin owns.
-     *
-     * It used to run on GlobalScope, where nothing could ever cancel it - the
-     * loop held this plugin's classloader for the life of the JVM after
-     * unload. The plugin starts it in register() and stops it in dispose().
-     */
-    fun start(scope: kotlinx.coroutines.CoroutineScope) {
-        watcherJob?.cancel()
-        watcherJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            while (isActive) {
-                kotlinx.coroutines.delay(500) // Check every 500ms
-                try {
-                    val currentModified = settingsFile.lastModified()
-                    if (currentModified != lastModified) {
-                        lastModified = currentModified
-                        val newSettings = loadFromFile()
-                        _settings.value = newSettings
-                    }
-                } catch (e: Exception) {
-                    // Ignore errors during file watch
-                }
-            }
-        }
-    }
-
-    fun stop() {
-        watcherJob?.cancel()
-        watcherJob = null
-    }
-
-    private fun loadFromFile(): PluginEditorSettingsData {
-        return try {
-            if (settingsFile.exists()) {
-                val content = settingsFile.readText()
-                json.decodeFromString<PluginEditorSettingsData>(content)
-            } else {
-                PluginEditorSettingsData()
-            }
-        } catch (e: Exception) {
-            PluginEditorSettingsData()
-        }
-    }
-}
 
 // ========== Color Parsing Helper ==========
 

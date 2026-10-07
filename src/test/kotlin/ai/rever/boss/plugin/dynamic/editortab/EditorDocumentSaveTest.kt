@@ -2,9 +2,13 @@ package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.bosseditor.core.EditorState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
@@ -38,7 +42,20 @@ class EditorDocumentSaveTest {
     }
 
     @Test
-    fun `provider false and exception preserve dirty state and baseline`() =
+    fun `default local writer commits the captured buffer without a host provider`() =
+        runBlocking {
+            withFile { file ->
+                val buffer = buffer(file)
+                assertEquals(DocumentSaveResult.SAVED, saveEditorDocument(buffer))
+                assertEquals(buffer.content, file.readText())
+                assertFalse(buffer.editorState.isModified.value)
+                assertEquals(signatureOf(file), buffer.knownSignature)
+                assertTrue(buffer.headStale)
+            }
+        }
+
+    @Test
+    fun `writer false and exception preserve dirty state and baseline`() =
         runBlocking {
             withFile { file ->
                 for (throws in listOf(false, true)) {
@@ -62,7 +79,7 @@ class EditorDocumentSaveTest {
         }
 
     @Test
-    fun `missing provider never falls back to a direct write`() =
+    fun `unavailable writer never falls back to a direct write`() =
         runBlocking {
             withFile { file ->
                 val buffer = buffer(file)
@@ -80,8 +97,8 @@ class EditorDocumentSaveTest {
                     if (!existing) assertTrue(file.delete())
                     val buffer = buffer(file)
                     val baseline = buffer.knownSignature
-                    // A provider test double exercises the plugin boundary. The real writer's
-                    // injected partial-output/metadata tests live in BossConsole #427.
+                    // This double exercises transaction state after a partial staging failure.
+                    // Production staging/metadata regressions live in AtomicFileWriteTest.
                     val result =
                         saveEditorDocument(buffer) { path, _ ->
                             val stage = Files.createTempFile(File(path).parentFile.toPath(), ".stage-", ".tmp")
@@ -125,7 +142,7 @@ class EditorDocumentSaveTest {
         }
 
     @Test
-    fun `external edits and unresolved watcher conflicts prevent provider invocation`() =
+    fun `external edits and unresolved watcher conflicts prevent writer invocation`() =
         runBlocking {
             withFile { file ->
                 val buffer = buffer(file)
@@ -161,11 +178,11 @@ class EditorDocumentSaveTest {
                             commit(path, text)
                         }
                     }
-                started.await()
+                withTimeout(5_000) { started.await() }
                 buffer.editorState.insertText("new typing")
                 save.cancel()
                 finish.countDown()
-                save.join()
+                withTimeout(5_000) { save.join() }
                 assertEquals(captured, file.readText())
                 assertEquals(signatureOf(file), buffer.knownSignature)
                 assertTrue(buffer.editorState.isModified.value)
@@ -179,6 +196,7 @@ class EditorDocumentSaveTest {
             withFile { file ->
                 val buffer = buffer(file)
                 val started = CompletableDeferred<Unit>()
+                val secondStarted = CompletableDeferred<Unit>()
                 val finish = CountDownLatch(1)
                 val manual =
                     async {
@@ -188,13 +206,90 @@ class EditorDocumentSaveTest {
                             commit(path, text)
                         }
                     }
-                started.await()
+                withTimeout(5_000) { started.await() }
                 buffer.editorState.insertText("later")
-                val autosave = async { saveEditorDocument(buffer, ::commit) }
-                finish.countDown()
-                assertEquals(DocumentSaveResult.SAVED, manual.await())
-                assertEquals(DocumentSaveResult.SAVED, autosave.await())
+                val autosave = async(start = CoroutineStart.UNDISPATCHED) {
+                    saveEditorDocument(buffer) { path, text ->
+                        secondStarted.complete(Unit)
+                        commit(path, text)
+                    }
+                }
+                try {
+                    assertEquals(null, withTimeoutOrNull(500) { secondStarted.await() },
+                        "a second viewport began writing before the first transaction finished")
+                } finally {
+                    finish.countDown()
+                }
+                assertEquals(DocumentSaveResult.SAVED, withTimeout(5_000) { manual.await() })
+                assertEquals(DocumentSaveResult.SAVED, withTimeout(5_000) { autosave.await() })
                 assertEquals(buffer.content, file.readText())
+                assertFalse(buffer.editorState.isModified.value)
+            }
+        }
+
+    @Test
+    fun `reload requested during a blocked save waits and cannot leave a clean stale buffer`() =
+        runBlocking {
+            withFile { file ->
+                val buffer = buffer(file)
+                val captured = buffer.content
+                val started = CompletableDeferred<Unit>()
+                val finish = CountDownLatch(1)
+                val save = async {
+                    saveEditorDocument(buffer) { path, text ->
+                        started.complete(Unit)
+                        check(finish.await(5, TimeUnit.SECONDS))
+                        commit(path, text)
+                    }
+                }
+                withTimeout(5_000) { started.await() }
+                file.writeText("external content seen before commit")
+                val watcher = ExternalChangeWatcher(this, applyOn = Dispatchers.Unconfined)
+                val reload = async(start = CoroutineStart.UNDISPATCHED) { watcher.resolveByReloading(buffer) }
+                try {
+                    assertFalse(reload.isCompleted, "reload changed the buffer while its save was in flight")
+                    assertEquals(captured, buffer.content)
+                    assertTrue(buffer.editorState.isModified.value)
+                } finally {
+                    finish.countDown()
+                }
+                assertEquals(DocumentSaveResult.SAVED, withTimeout(5_000) { save.await() })
+                withTimeout(5_000) { reload.await() }
+                assertEquals(captured, file.readText())
+                assertEquals(file.readText(), buffer.content)
+                assertFalse(buffer.editorState.isModified.value)
+                assertEquals(signatureOf(file), buffer.knownSignature)
+            }
+        }
+
+    @Test
+    fun `watcher observation waits for the save transaction before adopting disk state`() =
+        runBlocking {
+            withFile { file ->
+                val buffer = buffer(file)
+                val started = CompletableDeferred<Unit>()
+                val finish = CountDownLatch(1)
+                val save = async {
+                    saveEditorDocument(buffer) { path, text ->
+                        started.complete(Unit)
+                        check(finish.await(5, TimeUnit.SECONDS))
+                        commit(path, text)
+                    }
+                }
+                withTimeout(5_000) { started.await() }
+                file.writeText("external content seen before commit")
+                val watcher = ExternalChangeWatcher(this, applyOn = Dispatchers.Unconfined)
+                val observation = async(start = CoroutineStart.UNDISPATCHED) { watcher.checkOnce(buffer) }
+                try {
+                    assertEquals(null, withTimeoutOrNull(500) { observation.await(); true },
+                        "watcher applied an observation while the save was in flight")
+                } finally {
+                    finish.countDown()
+                }
+                assertEquals(DocumentSaveResult.SAVED, withTimeout(5_000) { save.await() })
+                withTimeout(5_000) { observation.await() }
+                assertEquals(buffer.content, file.readText())
+                assertEquals(ExternalState.IN_SYNC, buffer.externalState.value)
                 assertFalse(buffer.editorState.isModified.value)
             }
         }
@@ -239,7 +334,7 @@ class EditorDocumentSaveTest {
         val stage = Files.createTempFile(target.parent, ".stage-", ".tmp")
         try {
             Files.writeString(stage, text)
-            Files.move(stage, target, StandardCopyOption.ATOMIC_MOVE)
+            Files.move(stage, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } finally {
             Files.deleteIfExists(stage)
         }

@@ -10,9 +10,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertSame
-import kotlinx.serialization.descriptors.elementNames
-import java.io.File
-import kotlin.reflect.full.memberProperties
 import kotlin.test.assertTrue
 
 /**
@@ -331,20 +328,6 @@ class HostEditorThemeTest {
     }
 
     @Test
-    fun `the settings path falls back loudly when the data root cannot be resolved`() {
-        val resolved = resolveSettingsFile { name -> File("/tmp/boss-test-root", name) }
-        assertEquals(File("/tmp/boss-test-root", "editor-settings.json"), resolved)
-
-        // The branch that used to be unreachable from a test: a resolver that throws
-        // must not take the object's class initializer with it.
-        val fallback = resolveSettingsFile { error("no data root") }
-        assertEquals(
-            File(System.getProperty("user.home"), ".boss/editor-settings.json"),
-            fallback,
-        )
-    }
-
-    @Test
     fun `unpopulated host tokens are not published`() {
         // What register() sees if it ever runs before the host applies its theme:
         // every token is Unspecified, which is alpha 0, and compositing ten of those
@@ -453,59 +436,8 @@ class HostEditorThemeTest {
     }
 
     @Test
-    fun `the plugin default follows the host, and agrees with the library`() {
-        // Both halves read one editor-settings.json, so the invariant is not "this is
-        // true" but "these two agree". Asserted against the library so the pin bump is
-        // what fails, rather than a user seeing the wrong theme.
-        assertEquals(true, PluginEditorSettingsData().followHostTheme)
-        assertEquals(EditorSettings().followHostTheme, PluginEditorSettingsData().followHostTheme)
-    }
-
-    @Test
-    fun `the settings mirror does not drift from the library's`() {
-        // ignoreUnknownKeys means a rename on the library side degrades silently and
-        // permanently to this mirror's defaults - followHostTheme would read true
-        // forever, whatever the toggle did. Compare the whole struct, not one field.
-        val mirror = PluginEditorSettingsData()
-        val library = EditorSettings()
-        val libraryProps = EditorSettings::class.memberProperties.associateBy { it.name }
-
-        val missing = mutableListOf<String>()
-        val differing = mutableListOf<String>()
-        val mirrorProps = PluginEditorSettingsData::class.memberProperties.associateBy { it.name }
-        for (property in mirrorProps.values) {
-            val theirs = libraryProps[property.name]
-            if (theirs == null) {
-                missing += property.name
-                continue
-            }
-            val ours = property.getter.call(mirror)
-            val libraryValue = theirs.getter.call(library)
-            if (ours != libraryValue) differing += "${property.name} (mirror=$ours, library=$libraryValue)"
-        }
-
-        // The wire format, not just the property names: a @SerialName on either side
-        // renames the key while leaving both Kotlin names identical, which is exactly
-        // the divergence ignoreUnknownKeys hides. Defaults still need the reflection
-        // above, since a descriptor does not carry them.
-        val mirrorKeys = PluginEditorSettingsData.serializer().descriptor.elementNames.toSet()
-        val libraryKeys = EditorSettings.serializer().descriptor.elementNames.toSet()
-
-        // Both directions. A field the library gained and the mirror lacks is the
-        // failure ignoreUnknownKeys actually hides: the tab silently keeps this
-        // mirror's default forever, whatever the panel writes. Anything deliberately
-        // unmirrored belongs in the allowlist, with a reason.
-        val deliberatelyUnmirrored = emptySet<String>()
-        val unmirrored = libraryProps.keys - mirrorProps.keys - deliberatelyUnmirrored
-
-        assertTrue(missing.isEmpty(), "fields the library no longer has: $missing")
-        assertTrue(differing.isEmpty(), "defaults that disagree: $differing")
-        assertTrue(unmirrored.isEmpty(), "settings the library has and this mirror does not: $unmirrored")
-        assertEquals(
-            libraryKeys - deliberatelyUnmirrored,
-            mirrorKeys,
-            "serialized keys differ, so one side is reading a name the other never writes",
-        )
+    fun `the editor default follows the host`() {
+        assertEquals(true, EditorSettings().followHostTheme)
     }
 
     @Test

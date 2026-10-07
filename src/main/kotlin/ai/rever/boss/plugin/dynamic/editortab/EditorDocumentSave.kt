@@ -8,13 +8,14 @@ import java.io.File
 import java.io.IOException
 
 /**
- * Shared by manual save, autosave and the diff pane. The host owns atomic disk replacement.
- * Providers may throw ordinary failures; fatal JVM errors still propagate.
+ * Shared by manual save, autosave and the editable diff pane. The plugin's local
+ * writer owns atomic disk replacement independently of the host release.
+ * Ordinary failures leave the buffer unsaved; fatal JVM errors still propagate.
  */
 @Suppress("TooGenericExceptionCaught")
 internal suspend fun saveEditorDocument(
     buffer: EditorBuffer,
-    write: ((String, String) -> Boolean)?,
+    write: ((String, String) -> Boolean)? = ::writeProtectedEditorFile,
 ): DocumentSaveResult =
     buffer.saveMutex.withLock {
         val state = buffer.editorState
@@ -60,4 +61,18 @@ internal suspend fun saveEditorDocument(
                 DocumentSaveResult.FAILED
             }
         }
+    }
+
+/** Local disk commit used by every document-save viewport; never truncates the destination. */
+@Suppress("TooGenericExceptionCaught")
+internal fun writeProtectedEditorFile(path: String, content: String): Boolean =
+    try {
+        val file = File(path)
+        file.parentFile?.mkdirs()
+        AtomicFileWrite.writeText(file, content)
+        true
+    } catch (failure: Exception) {
+        // Edited text and exception messages may contain credentials. Log only metadata.
+        System.err.println("[EditorDocumentSave] Failed to save '$path' (${failure::class.simpleName})")
+        false
     }

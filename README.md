@@ -48,8 +48,9 @@ The editor supports syntax highlighting for many languages including:
 
 ## Saving files
 
-See [protected saves](docs/protected-saves.md) for failure behavior, filesystem
-limits, and the required host/plugin release ordering.
+Manual save, autosave, and editable diff-pane saves share a protected local save
+transaction. See [protected saves](docs/protected-saves.md) for failure behavior
+and filesystem limits.
 
 ## License
 

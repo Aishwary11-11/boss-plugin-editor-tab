@@ -8,7 +8,7 @@ Code editor tab with syntax highlighting, code folding, and run gutter icons
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.editortab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin`
-- **API Version**: pinned in `build.gradle.kts` (currently `boss-plugin-api-1.0.87.jar`); the floor moves whenever the plugin uses a newer surface
+- **API Version**: the compile-time jar is pinned in `build.gradle.kts` (currently `boss-plugin-api-1.0.87.jar` locally, matching build.gradle.kts; CI downloads the latest release). The FLOOR (`apiVersion`/`minApiVersion` in `plugin.json`) is `1.0.87` - the plugin uses no 1.0.88+ surface, and the floor moves only when it actually does
 
 ## Essential Commands
 
@@ -55,9 +55,14 @@ build.gradle.kts   → Build config + version (single source of truth)
 - Providers from `PluginContext`: `workspaceDataProvider`, `splitViewOperations`, `contextMenuProvider`, `activeTabsProvider`
 - Null-safe provider access: providers may be null, UI must handle gracefully
 
+### Saving
+- **Never `File.writeText` a document.** It truncates the destination before writing, so any failure after that point destroys the previous contents - and auto save fires on a timer, so the window is permanent rather than occasional. `AtomicFileWrite.writeText` stages beside the file, forces, and moves into place; both the editor tab's save and the diff tab's apply go through it (#31).
+- A failed save must leave the document modified, skip `noteWrittenByUs()` and surface the error. `saveFile` returning null is what carries all three, so keep the bookkeeping after the write, never before.
+- The save does **not** go through the host's `EditorContentProvider.writeFileContent`: published hosts still truncate files through that provider and BossConsole#427 is unreleased, so local protected saves work independently of host version.
+
 ### Dependencies
 - **boss-plugin-api**: compileOnly (provided by host app at runtime)
-- **bosseditor-compose-desktop**: bundled privately; 1.0.13 provides multiline inline AI suggestions and the LSP startup fixes used here
+- **bosseditor-compose-desktop**: bundled privately; 1.0.26 provides the jsonrpc wire fix (the REQUIRED `jsonrpc` field was being dropped from every outgoing message, so strict servers answered nothing), the pointer-idle hover (`EditorHover`/`hoverProvider`), and the Cmd+Click whitespace/EOL/empty-line snapping used here
 - **Compose Desktop**: UI framework
 - **Decompose**: Navigation and component lifecycle
 - **Coroutines**: Async operations
@@ -82,3 +87,10 @@ Pushes to `main` trigger the release workflow which:
 3. Publishes to the BOSS Plugin Store
 
 The workflow is defined in `.github/workflows/build.yml` and delegates to the shared workflow in `risa-labs-inc/BossConsole-Releases`.
+
+### Temporary BossEditor compatibility overrides
+
+The pinned 1.0.26 dependency has minimap and FontUtils source overrides under
+`src/main/kotlin/ai/rever/bosseditor/` for BOSS 9.5.25. Review the version guard,
+packaging exclusions, and compatibility tests whenever updating BossEditor.
+Remove these overrides after adopting the upstream rendering fix (BossEditor #24).

@@ -400,6 +400,7 @@ class DiffTabComponent(
         onEditableChanged: (Boolean) -> Unit,
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
+        val resolutionScope = rememberCoroutineScope()
         // [canEdit] hops its own dispatchers - the disk read to IO, the live
         // document comparison to Main - so this effect only has to ask the
         // question, once per key change while the pane is read-only.
@@ -435,6 +436,7 @@ class DiffTabComponent(
         content: @Composable (state: EditorState, editable: Boolean) -> Unit,
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
+        val resolutionScope = rememberCoroutineScope()
 
         // Acquire and release are keyed IDENTICALLY, on the slot. The acquire
         // has to be asynchronous (a whole-file read must not run on the
@@ -474,12 +476,16 @@ class DiffTabComponent(
                 ExternalChangeBar(
                     buffer = editableBuffer,
                     onReload = {
-                        ExternalChangeWatcher.current()?.resolveByReloading(editableBuffer)
-                        onNote(null)
+                        resolutionScope.launch {
+                            ExternalChangeWatcher.current()?.resolveByReloading(editableBuffer)
+                            onNote(null)
+                        }
                     },
                     onKeepMine = {
-                        ExternalChangeWatcher.current()?.resolveByKeepingMine(editableBuffer)
-                        onNote(null)
+                        resolutionScope.launch {
+                            ExternalChangeWatcher.current()?.resolveByKeepingMine(editableBuffer)
+                            onNote(null)
+                        }
                     },
                 )
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -612,13 +618,8 @@ class DiffTabComponent(
                     if (event.type == KeyEventType.KeyDown && meta && event.key == Key.S) {
                         if (state.isModified.value) {
                             scope.launch {
-                                val result =
-                                    EditorBufferRegistry.find(absolutePath)?.let {
-                                        saveEditorDocument(
-                                            it,
-                                            context.editorContentProvider?.let { provider -> provider::writeFileContent },
-                                        )
-                                    } ?: DocumentSaveResult.UNAVAILABLE
+                                val result = EditorBufferRegistry.find(absolutePath)
+                                    ?.let { saveEditorDocument(it) } ?: DocumentSaveResult.UNAVAILABLE
                                 onNote(if (result == DocumentSaveResult.SAVED) "Saved" else result.message)
                             }
                         }
@@ -740,7 +741,7 @@ class DiffTabComponent(
         pane: DiffSides.Pane,
         state: EditorState,
     ) {
-        val settings by PluginEditorSettings.settings.collectAsState()
+        val settings by editorSettingsFlow().collectAsState()
         val viewport by state.visibleViewport.collectAsState()
         val scroll by state.scrollOffset.collectAsState()
         val mapper by state.visualLineMapper.collectAsState()
@@ -1036,7 +1037,7 @@ class DiffTabComponent(
         marks: List<DiffSides.OverviewMark?>,
         state: EditorState,
     ) {
-        val settings by PluginEditorSettings.settings.collectAsState()
+        val settings by editorSettingsFlow().collectAsState()
         val viewport by state.visibleViewport.collectAsState()
         val mapper by state.visualLineMapper.collectAsState()
         val document = state.document
