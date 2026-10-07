@@ -57,8 +57,9 @@ build.gradle.kts   → Build config + version (single source of truth)
 
 ### Saving
 - **Never `File.writeText` a document.** It truncates the destination before writing, so any failure after that point destroys the previous contents - and auto save fires on a timer, so the window is permanent rather than occasional. `AtomicFileWrite.writeText` stages beside the file, forces, and moves into place; both the editor tab's save and the diff tab's apply go through it (#31).
-- A failed save must leave the document modified, skip `noteWrittenByUs()` and surface the error. `saveFile` returning null is what carries all three, so keep the bookkeeping after the write, never before.
+- A failed save must leave the document modified, skip `noteWrittenByUs()` and surface the error. `saveEditorDocument` updates bookkeeping only after a successful commit and marks only the captured document version saved.
 - The save does **not** go through the host's `EditorContentProvider.writeFileContent`: published hosts still truncate files through that provider and BossConsole#427 is unreleased, so local protected saves work independently of host version.
+- `editor_write_file` also uses the local protected writer on `Dispatchers.IO`, retains `editor.write` RBAC, and locks all open buffers matching the physical target in a stable order, including alternate path spellings. It is a disk-only overwrite: never mark a live buffer clean or hide its external-change conflict after a tool write.
 
 ### Dependencies
 - **boss-plugin-api**: compileOnly (provided by host app at runtime)

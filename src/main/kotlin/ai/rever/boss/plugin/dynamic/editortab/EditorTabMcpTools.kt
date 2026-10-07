@@ -9,11 +9,16 @@ import ai.rever.boss.plugin.api.McpToolHandler
 import ai.rever.boss.plugin.api.McpToolProvider
 import ai.rever.boss.plugin.api.McpToolResult
 import ai.rever.boss.plugin.api.PluginContext
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.Path
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * MCP tools contributed by the Code Editor Tab plugin: read/write files through
- * the host editor infrastructure, detect a file's language, and (1.0.87) drive
+ * MCP tools contributed by the Code Editor Tab plugin: read files through the
+ * host, protect disk writes locally, detect a file's language, and (1.0.87) drive
  * the live editor buffers - read a buffer, read the focused document plus its
  * selection, apply an undoable range edit, open a split view.
  *
@@ -28,6 +33,7 @@ internal class EditorTabMcpToolProvider(
     private val editorApi: EditorTabPluginAPI?,
     private val composerAgent: ComposerAgent?,
     private val composerSessions: ComposerSessions?,
+    private val writeToDisk: (String, String) -> Boolean = ::writeProtectedEditorFile,
 ) : McpToolProvider {
 
     override fun tools(): List<McpToolDefinition> = listOf(
@@ -53,19 +59,18 @@ internal class EditorTabMcpToolProvider(
         // is the one that most wants the permission.
         McpToolDefinition.withRbac(
             name = "editor_write_file",
-            description = "Write (create or overwrite) a file via the BOSS editor.",
+            description = "Write (create or overwrite) a file with protected atomic replacement.",
             inputSchema = WRITE_SCHEMA,
             readOnly = false,
             requiredPermissions = listOf("editor.write"),
             handler = McpToolHandler { args ->
-                val e = editor ?: return@McpToolHandler unavailable()
                 val path = args.string("path")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: path", isError = true)
                 // Error rather than default to "" - a missing/null content must not
                 // silently truncate the target file to empty.
                 val content = args.string("content")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: content", isError = true)
-                if (e.writeFileContent(path, content)) McpToolResult("Wrote ${content.length} chars to $path.")
+                if (writeToolFile(path, content)) McpToolResult("Wrote ${content.length} chars to $path.")
                 else McpToolResult("Write failed for $path.", isError = true)
             },
         ),
@@ -488,6 +493,72 @@ internal class EditorTabMcpToolProvider(
             },
         ),
     )
+
+    /** Disk-only overwrite: serialize all physical-target buffers without marking their edits saved. */
+    private suspend fun writeToolFile(path: String, content: String): Boolean = withContext(Dispatchers.IO) {
+        fun commit(): Boolean =
+            try {
+                writeToDisk(path, content)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+        val target = try {
+            File(path).toPath().toAbsolutePath()
+        } catch (_: Exception) {
+            return@withContext false
+        }
+        // Registry keys are only absolute spellings. Resolve aliases on IO for
+        // locking, while passing the original disk argument unchanged to the writer.
+        val direct = EditorBufferRegistry.find(target.toString())
+        val buffers = EditorBufferRegistry.all().filter { buffer ->
+            buffer === direct || refersToWriteTarget(buffer.path, target)
+        }.distinct().sortedBy { it.path }
+        val locked = mutableListOf<EditorBuffer>()
+        try {
+            // Different spellings can produce several buffers for one physical
+            // file. A stable order prevents overlapping tool writes deadlocking.
+            for (buffer in buffers) {
+                buffer.saveMutex.lock()
+                locked += buffer
+            }
+            commit()
+        } finally {
+            for (buffer in locked.asReversed()) buffer.saveMutex.unlock()
+        }
+    }
+
+    private fun refersToWriteTarget(bufferPath: String, target: Path): Boolean = try {
+        val candidate = File(bufferPath).toPath().toAbsolutePath()
+        val sameExistingFile = try {
+            Files.isSameFile(candidate, target)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+        sameExistingFile || realWriteLocation(target)?.let { it == realWriteLocation(candidate) } == true
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Follow existing symlink/.. semantics before resolving the absent final filename. */
+    private fun realWriteLocation(path: Path): Path? = try {
+        path.toRealPath()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        try {
+            path.parent?.toRealPath()?.resolve(path.fileName)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     private fun unavailable(): McpToolResult =
         McpToolResult("Editor content provider unavailable in this context.", isError = true)

@@ -49,8 +49,9 @@ The editor supports syntax highlighting for many languages including:
 ## Saving files
 
 Manual save, autosave, and editable diff-pane saves share a protected local save
-transaction. See [protected saves](docs/protected-saves.md) for failure behavior
-and filesystem limits.
+transaction. The `editor_write_file` MCP tool uses the same protected disk writer
+without requiring a newer host. See [protected saves](docs/protected-saves.md)
+for failure behavior and filesystem limits.
 
 ## License
 

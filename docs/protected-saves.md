@@ -56,7 +56,7 @@ follow-up `2e077c5762e9ec75108d238a94b609e751c99e01`). The integration uses the
 local writer instead of #32's host-provider callback.
 
 [BossConsole #427](https://github.com/risa-labs-inc/BossConsole/pull/427) remains
-independently useful for `editor_write_file` and other callers of the host's
+independently useful for other callers of the host's
 `EditorContentProvider`. Published BOSS 9.5.41 still delegates that provider to
 a direct `File.writeText`, so normal document saves use the protected local
 writer. A future provider migration must verify the first host release containing
@@ -69,6 +69,32 @@ necessary for the save integration here: a save or conflict choice can supersede
 a watcher read before it reaches the UI thread. Keep its race tests when merging
 the save lock, and never hold that lock while waiting to dispatch the UI update.
 
+## MCP disk writes
+
+`editor_write_file` uses the same local protected writer on a background I/O
+dispatcher, including when the host editor provider is unavailable. It retains
+the `editor.write` permission requirement and validates both path and content
+before writing. Missing or null content fails rather than erasing a document;
+explicit empty content still means an intentional empty file.
+
+The tool remains a disk-only create/overwrite operation without a document-version
+guard. Its write waits for save transactions on all open buffers matching the
+physical target, including dot-path and symlink aliases. It acquires their locks
+in a stable order without changing registry keys or the disk argument. It does
+not mark buffers saved or update their disk baselines: the
+watcher still surfaces a conflict if the tool changes disk beneath unsaved edits.
+Use `editor_apply_edit` for version-checked changes to live editor buffers.
+
+On failure the tool returns an error without the edited text or raw exception.
+Partial staging failures preserve an existing file, leave a failed first-save
+destination absent, and clean up staging output. The same filesystem and metadata
+limits described above apply.
+
+This is the remaining protection added by #32 after #40 incorporated its original
+document-save pipeline. It has no new host-version dependency; the manifest keeps
+the current host floor instead of guessing a future release number. Host #427
+remains independently useful for other plugins calling `EditorContentProvider`.
+
 ## Regression coverage
 
 `EditorDocumentSaveTest` covers failed/unavailable writers, partial staging
@@ -77,3 +103,7 @@ serialization, cancellation after writing starts, and newer typing staying
 dirty. It also exercises the default local writer without a host provider.
 `AtomicFileWriteTest` checks the production staging, replacement, symlink,
 permission, concurrency, and cleanup behavior separately.
+`EditorMcpAtomicWriteTest` calls the actual MCP handler and checks old/missing
+providers, partial production staging failures, UTF-8/empty writes, argument and
+permission contracts, I/O dispatch, live-buffer transactions, and existing or
+absent targets reached through dot paths, symlinks, and symlink/.. traversal.
