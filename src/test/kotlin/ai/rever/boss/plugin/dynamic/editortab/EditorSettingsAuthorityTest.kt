@@ -80,9 +80,6 @@ class EditorSettingsAuthorityTest {
     }
 
     private fun newManager(settingsFile: File): EditorSettingsManager {
-        val constructor =
-            EditorSettingsManager::class.java.getDeclaredConstructor(String::class.java)
-        constructor.isAccessible = true
-        return constructor.newInstance(settingsFile.absolutePath)
+        return EditorSettingsManager.withCustomPath(settingsFile.absolutePath)
     }
 }
