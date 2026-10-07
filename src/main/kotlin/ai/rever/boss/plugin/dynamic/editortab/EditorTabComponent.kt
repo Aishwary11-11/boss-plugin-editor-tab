@@ -8,6 +8,7 @@ import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.boss.plugin.ui.ContextMenuItemData
 import ai.rever.bosseditor.compose.BossEditor
+import ai.rever.bosseditor.compose.EditorHover
 import ai.rever.bosseditor.compose.NavigationResolveResult
 import ai.rever.bosseditor.config.BossDirectories
 import ai.rever.bosseditor.features.UsagesPopup
@@ -1274,6 +1275,30 @@ class EditorTabComponent(
                     // A settings change must replace the resolver in already-open tabs. It also
                     // forces LspSettingsManager's synchronous load before consulting the registry.
                     val lspConfig by LspSettingsManager.instance.configuration.collectAsState()
+                    // One guard for all three LSP call sites (warm-up, navigation, hover) so
+                    // they cannot drift apart: a large file never starts a server, a disabled
+                    // feature answers nothing, and only files whose language has a registered
+                    // server (PSI-only .kt/.kts do not) can be served. Remembered on the
+                    // same keys as the warm-up below, so the registry is consulted only
+                    // when one of them changes - not on every recomposition (caret moves,
+                    // gutter updates).
+                    val lspServesThisFile = remember(filePath, lspConfig, isLargeFile) {
+                        !isLargeFile && lspConfig.enabled && LspNavigation.usesLsp(filePath)
+                    }
+                    // Warm the language server on open (and on every disk reload) so the
+                    // first hover or Cmd+Click answers from a warm server instead of
+                    // paying spawn + initialize + settle on the user's first gesture.
+                    // lspConfig is a key - not just read in the body - so enabling LSP in
+                    // settings with tabs already open re-arms the warm-up; without it the
+                    // first gesture still pays the cold start, the case this exists to fix.
+                    // No-op for files nothing can serve; edits keep in sync because
+                    // every later lookup re-syncs the document.
+                    LaunchedEffect(filePath, contentVersion, lspConfig) {
+                        if (!lspServesThisFile) {
+                            return@LaunchedEffect
+                        }
+                        LspNavigation.shared.warmUp(initialContent, filePath, projectPath)
+                    }
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1325,11 +1350,30 @@ class EditorTabComponent(
                         lspConfig,
                         isLargeFile,
                     ) {
-                        if (isLargeFile || !lspConfig.enabled || !LspNavigation.usesLsp(filePath)) {
+                        if (!lspServesThisFile) {
                             null
                         } else {
                             { content, path, offset ->
                                 LspNavigation.shared.resolveDefinition(content, path, offset, projectPath)
+                            }
+                        }
+                    },
+                    // The pointer counterpart of navigation: rest over a symbol and the
+                    // server's signature/docs appear in a tooltip. Same routing as the
+                    // resolver - PSI has no hover path at all, so only files whose
+                    // language has a registered server can answer, and the same guards
+                    // apply (a large file does not start a server just for the pointer).
+                    hoverProvider = remember<(suspend (String, String, Int) -> EditorHover?)?>(
+                        filePath,
+                        projectPath,
+                        lspConfig,
+                        isLargeFile,
+                    ) {
+                        if (!lspServesThisFile) {
+                            null
+                        } else {
+                            { content, path, offset ->
+                                LspNavigation.shared.resolveHover(content, path, offset, projectPath)
                             }
                         }
                     },

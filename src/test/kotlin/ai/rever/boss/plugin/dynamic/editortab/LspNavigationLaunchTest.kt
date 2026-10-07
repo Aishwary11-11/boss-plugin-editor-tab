@@ -4,27 +4,111 @@ import ai.rever.bosseditor.compose.NavigationResolveResult
 import ai.rever.bosseditor.lsp.client.LspClient
 import ai.rever.bosseditor.lsp.client.LspClientState
 import ai.rever.bosseditor.lsp.client.LspMethods
+import ai.rever.bosseditor.lsp.config.LspSettingsManager
 import ai.rever.bosseditor.lsp.protocol.InitializeParams
 import ai.rever.bosseditor.lsp.protocol.InitializeResult
 import ai.rever.bosseditor.lsp.protocol.ServerCapabilities
 import ai.rever.bosseditor.lsp.server.LanguageServerConfig
+import ai.rever.bosseditor.lsp.server.LanguageServerRegistry
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import java.io.File
+import org.junit.Assume
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertNotSame
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+
+/**
+ * Fake LSP stdio server for the warm-up / hover-failure tests above.
+ *
+ * Answers `initialize`, then behaves per the MODE FILE named by
+ * FAKE_LSP_MODE_FILE (read at startup, so a test can rewrite it between
+ * phases): `healthy` answers `textDocument/hover` with a fixed markdown
+ * hover, `hang` swallows every later message (a slow server), `die` exits
+ * right after the handshake (a server that crashes mid-session). Writes its
+ * own PID to FAKE_LSP_PID_FILE so the tests can assert on the PROCESS, not
+ * just on the nulls coming back.
+ */
+private val FAKE_LSP_SERVER_PYTHON = """
+    #!/usr/bin/env python3
+    import json, os, sys, time
+
+    def read_message():
+        headers = {}
+        while True:
+            line = sys.stdin.buffer.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower()] = v.strip()
+        n = int(headers.get(b"content-length", b"0"))
+        if n <= 0:
+            return None
+        return sys.stdin.buffer.read(n)
+
+    def send(obj):
+        data = json.dumps(obj).encode("utf-8")
+        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+        sys.stdout.buffer.flush()
+
+    mode = "healthy"
+    mode_file = os.environ.get("FAKE_LSP_MODE_FILE", "")
+    if mode_file:
+        try:
+            with open(mode_file) as f:
+                mode = f.read().strip() or "healthy"
+        except Exception:
+            pass
+    pid_file = os.environ.get("FAKE_LSP_PID_FILE", "")
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+
+    while True:
+        body = read_message()
+        if body is None:
+            break
+        try:
+            msg = json.loads(body)
+        except Exception:
+            continue
+        method = msg.get("method")
+        msg_id = msg.get("id")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg_id,
+                  "result": {"capabilities": {"hoverProvider": True,
+                                               "definitionProvider": True}}})
+            if mode == "die":
+                # Let the initialized/didOpen notifications land first, then
+                # crash: the client must have finished the handshake before
+                # the process disappears.
+                time.sleep(0.3)
+                break
+        elif method == "textDocument/hover" and mode == "healthy":
+            send({"jsonrpc": "2.0", "id": msg_id,
+                  "result": {"contents": {"kind": "markdown",
+                                           "value": "def fake_fn(x: int) -> int"}}})
+        # everything else (initialized/didOpen/didChange notifications, and
+        # hover in hang mode): no answer
+    """.trimIndent()
 
 /**
  * The three things that decide whether a click reaches a running server at all:
@@ -251,7 +335,18 @@ class LspNavigationLaunchTest {
             NavigationResolveResult.NotFound,
             navigation.resolveDefinition("const x = 1", "/tmp/a.ts", 0, "/tmp"),
         )
+        assertNull(navigation.resolveHover("const x = 1", "/tmp/a.ts", 0, "/tmp"))
     }
+
+    @Test
+    fun `a hover over a file with no registered server returns null without starting anything`() =
+        runBlocking {
+            // Same guard rail as definition: the pointer idling over an unsupported
+            // file must not spawn a server, and the null lets the editor skip the
+            // tooltip instead of reporting a failed lookup.
+            val navigation = LspNavigation()
+            assertNull(navigation.resolveHover("x = 1", "/tmp/nothing.zzz", 0, "/tmp"))
+        }
 
     @Test
     fun `fresh registration re-arms a disposed shared navigation`() {
@@ -301,6 +396,307 @@ class LspNavigationLaunchTest {
             }
         }
         assertFalse(innerReturned)
+    }
+
+    @Test
+    fun `a cancelled cold start is not recorded as a startup failure`() = runBlocking {
+        // The regression: a cold start interrupted by the caller (the pointer moved on,
+        // the tab closed, the buffer was re-set) used to come back out as a wrapped
+        // LanguageServerException, which this class read as "the server is broken" and
+        // answered with a five-minute failure cooldown - silently disabling navigation
+        // for the whole workspace after the very first cancelled hover.
+        val config = LanguageServerConfig(
+            id = "fake-hanging-server",
+            displayName = "Fake Hanging Server",
+            languageId = "fake-hanging",
+            command = listOf("sh", "-c", "sleep 300"),
+            fileExtensions = listOf("zzfakehanging"),
+        )
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        val filePath = "/tmp/zzfakehanging-cancellation.zzfakehanging"
+        try {
+            // Pre-warm the lazy user-PATH probe so the cold start below is spawn +
+            // initialize, not a login shell first.
+            navigation.launchConfig(config, workingDirectory = "/tmp")
+
+            val scopeJob = SupervisorJob()
+            val scope = CoroutineScope(Dispatchers.IO + scopeJob)
+            val start = scope.launch {
+                navigation.resolveDefinition("x", filePath, 0, "/tmp")
+            }
+            delay(1_500) // let the process spawn and the initialize handshake hang
+            scopeJob.cancelAndJoin()
+            // The start must complete AS CANCELLED, not as a swallowed NotFound.
+            assertTrue(start.isCancelled)
+
+            // And the next request must attempt a FRESH start. A recorded failure
+            // cooldown would refuse it immediately with NotFound; a genuine retry
+            // hangs in a new initialize, still in flight well past 1.5s.
+            val retryScopeJob = SupervisorJob()
+            val retryScope = CoroutineScope(Dispatchers.IO + retryScopeJob)
+            val retry = retryScope.launch {
+                navigation.resolveDefinition("x", filePath, 0, "/tmp")
+            }
+            delay(1_500)
+            assertFalse(
+                retry.isCompleted,
+                "a cooled-down rejection returns NotFound immediately; a fresh start is still in flight",
+            )
+            retryScopeJob.cancelAndJoin()
+        } finally {
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
+    }
+
+    // ---- warm-up and hover failure branches (fake stdio server) ----------
+    //
+    // warmUp is the only entry point that starts a server with NO user gesture,
+    // and resolveHover is the newest failure path, so both get the fake-server
+    // treatment: a python3 stdio process that answers `initialize` and then
+    // behaves per a MODE FILE the test rewrites between phases, announcing its
+    // own PID so the tests can assert on the process, not just on nulls.
+
+    private fun fakeLspServerScript(dir: File): File =
+        File(dir, "fake-lsp-server.py").apply {
+            writeText(FAKE_LSP_SERVER_PYTHON)
+            setExecutable(true)
+        }
+
+    private fun fakeLspConfig(
+        dir: File,
+        mode: String,
+        id: String,
+        extension: String,
+        pidFile: File,
+    ): LanguageServerConfig {
+        val modeFile = File(dir, "$id-mode").apply { writeText(mode) }
+        return LanguageServerConfig(
+            id = id,
+            displayName = id,
+            languageId = id,
+            command = listOf("python3", fakeLspServerScript(dir).absolutePath),
+            fileExtensions = listOf(extension),
+            environment = mapOf(
+                "FAKE_LSP_MODE_FILE" to modeFile.absolutePath,
+                "FAKE_LSP_PID_FILE" to pidFile.absolutePath,
+            ),
+        )
+    }
+
+    private fun pidOf(pidFile: File): Int = pidFile.readText().trim().toInt()
+
+    private fun processIsAlive(pidFile: File): Boolean {
+        if (!pidFile.exists()) return false
+        return ProcessHandle.of(pidOf(pidFile).toLong()).map { it.isAlive }.orElse(false)
+    }
+
+    /**
+     * The fake-server tests need python3. Every GitHub runner has it, and so
+     * does this machine - but if it is ever missing, an ASSUMPTION failure
+     * reports the test as *skipped with a reason* rather than as a green test
+     * that asserts nothing. (Checked lazily per test-class instance; JUnit
+     * builds a fresh instance per method, so this is once per test, not once
+     * per class.)
+     */
+    private val PYTHON3_AVAILABLE: Boolean by lazy {
+        try {
+            val process = ProcessBuilder("python3", "--version").redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().readText().trim()
+            val ok = process.waitFor() == 0
+            if (!ok) System.err.println("[LspNavigationLaunchTest] python3 check failed: $output")
+            ok
+        } catch (error: Exception) {
+            System.err.println("[LspNavigationLaunchTest] python3 not on PATH: ${error.message}")
+            false
+        }
+    }
+
+    /** Fails the test as a JUnit assumption when python3 is absent (reports skipped). */
+    private fun requirePython3() {
+        Assume.assumeTrue(
+            "python3 not found on PATH (needed to run the fake LSP stdio server)",
+            PYTHON3_AVAILABLE,
+        )
+    }
+
+    /** Kill the fake server recorded in [pidFile] so a test never leaves a process behind. */
+    private fun killIfAlive(pidFile: File) {
+        if (!pidFile.exists()) return
+        ProcessHandle.of(pidOf(pidFile).toLong()).ifPresent { it.destroyForcibly() }
+    }
+
+    @Test
+    fun `warm-up starts the server for a file it can serve`() = runBlocking {
+        requirePython3()
+        // The positive control: opening a servable file spawns the server,
+        // which is the whole point of warming (the first gesture must not pay
+        // spawn + initialize + settle).
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "healthy", "warm-ok", "wok", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        try {
+            navigation.warmUp("x = 1", File(dir, "warm.wok").absolutePath, dir.absolutePath)
+            assertTrue(pidFile.exists(), "warm-up must spawn the server for a file it can serve")
+            assertTrue(processIsAlive(pidFile), "the warmed server must be left running")
+        } finally {
+            killIfAlive(pidFile)
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
+    }
+
+    @Test
+    fun `warm-up after dispose is a no-op`() = runBlocking {
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "healthy", "warm-disposed", "wfd", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        navigation.dispose()
+        navigation.warmUp("x = 1", File(dir, "warm.wfd").absolutePath, dir.absolutePath)
+        assertFalse(pidFile.exists(), "a disposed navigation must not spawn a server")
+        LanguageServerRegistry.unregister(config.languageId)
+    }
+
+    @Test
+    fun `warm-up for a file with no registered server spawns nothing`() = runBlocking {
+        // A silent no-op: no process, no error, nothing recorded.
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "healthy", "warm-unreg", "wur", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        try {
+            // .zzz has no registered server (the config above covers .wur only)
+            navigation.warmUp("x = 1", File(dir, "nothing.zzz").absolutePath, dir.absolutePath)
+            assertFalse(pidFile.exists(), "an unservable file must not start a server")
+            assertNull(LanguageServerRegistry.getConfigForFile(File(dir, "nothing.zzz").absolutePath))
+        } finally {
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
+    }
+
+    @Test
+    fun `warm-up with the feature disabled spawns nothing`() = runBlocking {
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "healthy", "warm-disabled", "wds", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        val previousEnabled = LspSettingsManager.instance.configuration.value.enabled
+        try {
+            LspSettingsManager.instance.setEnabled(false)
+            navigation.warmUp("x = 1", File(dir, "warm.wds").absolutePath, dir.absolutePath)
+            assertFalse(pidFile.exists(), "a disabled feature must not spawn a server")
+        } finally {
+            LspSettingsManager.instance.setEnabled(previousEnabled)
+            killIfAlive(pidFile)
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
+    }
+
+    @Test
+    fun `a timed-out hover degrades to null and keeps the warm server`() = runBlocking {
+        requirePython3()
+        // The fake server answers initialize and then swallows hover forever.
+        // A slow ANSWER is not a dead server: the result degrades to "no hover"
+        // and the live, initialized process must be left running for the next
+        // question (definition clicks and other tabs included).
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "hang", "hover-hang", "hhg", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        val previousTimeout = LspSettingsManager.instance.configuration.value.defaultRequestTimeoutMs
+        try {
+            LspSettingsManager.instance.setRequestTimeout(750)
+            val result = navigation.resolveHover(
+                "def fake_fn(x: int) -> int",
+                File(dir, "hover.hhg").absolutePath,
+                4,
+                dir.absolutePath,
+            )
+            assertNull(result, "a timed-out hover is 'no hover', not a hang or a crash")
+            assertTrue(processIsAlive(pidFile), "a slow hover must not stop a live, initialized server")
+        } finally {
+            LspSettingsManager.instance.setRequestTimeout(previousTimeout)
+            killIfAlive(pidFile)
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
+    }
+
+    @Test
+    fun `a hover times out on its own short budget, not the 30s click budget`() = runBlocking {
+        requirePython3()
+        // The configured default is the 30s click budget. A hover must not hold
+        // the pointer for that long: it has its own, shorter budget, so a hung
+        // server degrades to "no hover" in about a second and a half.
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "hang", "hover-cap", "hvc", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        val previousTimeout = LspSettingsManager.instance.configuration.value.defaultRequestTimeoutMs
+        try {
+            LspSettingsManager.instance.setRequestTimeout(30_000)
+            val startedAt = System.nanoTime()
+            assertNull(
+                navigation.resolveHover(
+                    "def fake_fn(x: int) -> int",
+                    File(dir, "hover.hvc").absolutePath,
+                    4,
+                    dir.absolutePath,
+                ),
+            )
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+            assertTrue(elapsedMs < 8_000, "hover must time out on its own ~1.5s budget, not 30s; took ${elapsedMs}ms")
+        } finally {
+            LspSettingsManager.instance.setRequestTimeout(previousTimeout)
+            killIfAlive(pidFile)
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
+    }
+
+    @Test
+    fun `a hover on a dead server degrades to null and the next hover restarts it`() = runBlocking {
+        requirePython3()
+        // Phase 1 ("die"): the server answers initialize, then exits mid-session.
+        // The hover must degrade to null - not crash, not burn a failure
+        // cooldown (a request-level death is not a startup failure).
+        // Phase 2 ("healthy"): the SAME lookup with a healthy server must
+        // succeed, proving the dead client did not stick and the happy path
+        // works end to end (real process, real wire, real parse).
+        val dir = tempDir()
+        val pidFile = File(dir, "pid")
+        val config = fakeLspConfig(dir, "die", "hover-die", "hdi", pidFile)
+        LanguageServerRegistry.register(config)
+        val navigation = LspNavigation()
+        val filePath = File(dir, "hover.hdi").absolutePath
+        val content = "def fake_fn(x: int) -> int"
+        try {
+            assertNull(navigation.resolveHover(content, filePath, 4, dir.absolutePath))
+            // Switch the same fake server to healthy: the NEXT cold start reads
+            // the new mode, so the second lookup runs against a live server.
+            File(dir, "hover-die-mode").writeText("healthy")
+            val hover = assertNotNull(
+                navigation.resolveHover(content, filePath, 4, dir.absolutePath),
+                "after a dead server, a fresh start must answer the hover again",
+            )
+            assertEquals("def fake_fn(x: int) -> int", hover.text)
+            assertTrue(hover.isMarkdown)
+        } finally {
+            killIfAlive(pidFile)
+            navigation.dispose()
+            LanguageServerRegistry.unregister(config.languageId)
+        }
     }
 
     // ---- document versions ----------------------------------------------
@@ -360,7 +756,13 @@ class LspNavigationLaunchTest {
         nav.syncDocument(first, "file:///a.ts", "typescript", "two")
 
         val restarted = RecordingClient()
+        // The old client had a logged hover timeout: its dedupe entry holds a
+        // strong reference (transport + process streams) and must be evicted
+        // with its opened entry, not kept until dispose().
+        nav.markHoverTimeoutLogged(first)
+        assertTrue(nav.hoverTimeoutLogged(first))
         assertTrue(nav.trackClient("typescript", "/root", restarted))
+        assertFalse(nav.hoverTimeoutLogged(first), "a replaced client's hover-timeout entry is evicted with its opened entry")
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "three")
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "four")
 
