@@ -167,7 +167,9 @@ internal object AtomicFileWrite {
                     ?: throw IOException("Cannot preserve DOS file attributes")
                 view.setHidden(dos.isHidden)
                 view.setSystem(dos.isSystem)
-                view.setArchive(dos.isArchive)
+                // Edited contents must be included in the next incremental backup.
+                // Apply before commit; Windows also sets this bit during rename.
+                view.setArchive(true)
                 view.setReadOnly(dos.isReadOnly)
             }
         }

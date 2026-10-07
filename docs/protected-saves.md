@@ -35,8 +35,9 @@ supports atomic replacement instead of retrying a destructive in-place write.
 Read-only destinations and locks can also prevent replacement.
 
 The local writer preserves supported ownership, POSIX group and rwx permissions,
-Windows ACLs, and DOS attributes. A failure reading or reapplying supported
-metadata fails the save; shared-file ownership may require additional permission.
+Windows ACLs, and DOS hidden/system/read-only flags. Edited DOS files are marked
+for incremental backup with the archive flag set. A failure reading or reapplying
+supported metadata fails the save; shared-file ownership may require additional permission.
 New POSIX files respect the process umask. Special mode bits and arbitrary
 extended attributes are not preserved. Atomic replacement changes file identity:
 hard-linked aliases retain the old contents.

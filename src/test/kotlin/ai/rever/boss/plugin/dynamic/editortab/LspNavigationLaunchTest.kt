@@ -116,6 +116,9 @@ private val FAKE_LSP_SERVER_PYTHON = """
  * replaced server is told about the document again.
  */
 class LspNavigationLaunchTest {
+    private val pythonCommand =
+        if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) "python" else "python3"
+
 
     private fun tempDir(): File =
         java.nio.file.Files.createTempDirectory("lspnav").toFile().also { it.deleteOnExit() }
@@ -405,48 +408,63 @@ class LspNavigationLaunchTest {
         // LanguageServerException, which this class read as "the server is broken" and
         // answered with a five-minute failure cooldown - silently disabling navigation
         // for the whole workspace after the very first cancelled hover.
+        requirePython3()
+        val directory = tempDir()
+        val pidFile = File(directory, "cancelled-start.pid")
+        val hangingServer = File(directory, "hanging-server.py").apply {
+            writeText("""
+                import os, time
+                with open(os.environ["FAKE_LSP_PID_FILE"], "w") as output:
+                    output.write(str(os.getpid()))
+                time.sleep(300)
+            """.trimIndent())
+        }
         val config = LanguageServerConfig(
             id = "fake-hanging-server",
             displayName = "Fake Hanging Server",
             languageId = "fake-hanging",
-            command = listOf("sh", "-c", "sleep 300"),
+            command = listOf(pythonCommand, hangingServer.absolutePath),
             fileExtensions = listOf("zzfakehanging"),
+            environment = mapOf("FAKE_LSP_PID_FILE" to pidFile.absolutePath),
         )
         LanguageServerRegistry.register(config)
         val navigation = LspNavigation()
-        val filePath = "/tmp/zzfakehanging-cancellation.zzfakehanging"
+        val filePath = File(directory, "cancellation.zzfakehanging").absolutePath
+        val scopeJob = SupervisorJob()
+        val retryScopeJob = SupervisorJob()
         try {
-            // Pre-warm the lazy user-PATH probe so the cold start below is spawn +
-            // initialize, not a login shell first.
-            navigation.launchConfig(config, workingDirectory = "/tmp")
-
-            val scopeJob = SupervisorJob()
-            val scope = CoroutineScope(Dispatchers.IO + scopeJob)
-            val start = scope.launch {
-                navigation.resolveDefinition("x", filePath, 0, "/tmp")
+            // Probe PATH before measuring the actual spawn/initialize cancellation.
+            navigation.launchConfig(config, workingDirectory = directory.absolutePath)
+            val start = CoroutineScope(Dispatchers.IO + scopeJob).launch {
+                navigation.resolveDefinition("x", filePath, 0, directory.absolutePath)
             }
-            delay(1_500) // let the process spawn and the initialize handshake hang
+            withTimeout(10_000) {
+                while (runCatching { pidFile.readText().trim().toIntOrNull() }.getOrNull() == null) delay(10)
+            }
+            val firstPid = pidOf(pidFile)
             scopeJob.cancelAndJoin()
-            // The start must complete AS CANCELLED, not as a swallowed NotFound.
             assertTrue(start.isCancelled)
+            killIfAlive(pidFile)
+            pidFile.delete()
 
-            // And the next request must attempt a FRESH start. A recorded failure
-            // cooldown would refuse it immediately with NotFound; a genuine retry
-            // hangs in a new initialize, still in flight well past 1.5s.
-            val retryScopeJob = SupervisorJob()
-            val retryScope = CoroutineScope(Dispatchers.IO + retryScopeJob)
-            val retry = retryScope.launch {
-                navigation.resolveDefinition("x", filePath, 0, "/tmp")
+            // A cooldown returns immediately without spawning. Require a new real
+            // child, then prove its uncompleted initialize remains cancellable.
+            val retry = CoroutineScope(Dispatchers.IO + retryScopeJob).launch {
+                navigation.resolveDefinition("x", filePath, 0, directory.absolutePath)
             }
-            delay(1_500)
-            assertFalse(
-                retry.isCompleted,
-                "a cooled-down rejection returns NotFound immediately; a fresh start is still in flight",
-            )
+            withTimeout(10_000) {
+                while (runCatching { pidFile.readText().trim().toIntOrNull() }.getOrNull() == null) delay(10)
+            }
+            assertTrue(pidOf(pidFile) != firstPid, "retry must spawn a fresh language server")
+            assertFalse(retry.isCompleted, "a fresh initialize must still be in flight")
             retryScopeJob.cancelAndJoin()
         } finally {
+            scopeJob.cancelAndJoin()
+            retryScopeJob.cancelAndJoin()
+            killIfAlive(pidFile)
             navigation.dispose()
             LanguageServerRegistry.unregister(config.languageId)
+            directory.deleteRecursively()
         }
     }
 
@@ -476,7 +494,7 @@ class LspNavigationLaunchTest {
             id = id,
             displayName = id,
             languageId = id,
-            command = listOf("python3", fakeLspServerScript(dir).absolutePath),
+            command = listOf(pythonCommand, fakeLspServerScript(dir).absolutePath),
             fileExtensions = listOf(extension),
             environment = mapOf(
                 "FAKE_LSP_MODE_FILE" to modeFile.absolutePath,
@@ -502,7 +520,7 @@ class LspNavigationLaunchTest {
      */
     private val PYTHON3_AVAILABLE: Boolean by lazy {
         try {
-            val process = ProcessBuilder("python3", "--version").redirectErrorStream(true).start()
+            val process = ProcessBuilder(pythonCommand, "--version").redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().readText().trim()
             val ok = process.waitFor() == 0
             if (!ok) System.err.println("[LspNavigationLaunchTest] python3 check failed: $output")
@@ -516,7 +534,7 @@ class LspNavigationLaunchTest {
     /** Fails the test as a JUnit assumption when python3 is absent (reports skipped). */
     private fun requirePython3() {
         Assume.assumeTrue(
-            "python3 not found on PATH (needed to run the fake LSP stdio server)",
+            "$pythonCommand not found on PATH (needed to run the fake LSP stdio server)",
             PYTHON3_AVAILABLE,
         )
     }

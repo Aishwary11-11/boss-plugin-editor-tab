@@ -423,18 +423,74 @@ class MarkdownPreviewShellTest {
 
     @Test
     fun `a symlink pointing out of the project is refused`() {
-        // The containment check is on canonical paths precisely for this: a link that is
-        // inside the project by path and outside it by target.
+        // NIO real paths follow symlinks on Windows too: a link is inside the
+        // project by path and outside it by target.
         val parent = Files.createTempDirectory("boss-preview-symlink").toFile().canonicalFile
         val root = File(parent, "project").apply { mkdirs() }
         val outside = File(parent, "id_rsa").apply { writeText("PRIVATE KEY") }
         val link = File(root, "innocent.md")
         try {
-            Files.createSymbolicLink(link.toPath(), outside.toPath())
+            createPreviewSymlink(link, outside)
             assertEquals(
                 PreviewLinkRoute.Refuse,
                 previewLinkRoute(link.toURI().toString(), root.path)
             )
+        } finally {
+            listOf(link, outside, root, parent).forEach { it.delete() }
+        }
+    }
+
+    @Test
+    fun `a symlink to an existing in project file still opens its real target`() {
+        val root = Files.createTempDirectory("boss-preview-inside-link").toFile()
+        val target = File(root, "README.md").apply { writeText("# project notes") }
+        val link = File(root, "notes.md")
+        try {
+            createPreviewSymlink(link, target)
+            assertEquals(PreviewLinkRoute.LocalFile(target.toPath().toRealPath().toString()),
+                previewLinkRoute(link.toURI().toString(), root.path))
+        } finally {
+            listOf(link, target, root).forEach { it.delete() }
+        }
+    }
+
+    @Test
+    fun `a symlinked project root allows only files in its real directory`() {
+        val parent = Files.createTempDirectory("boss-preview-root-link").toFile()
+        val root = File(parent, "project").apply { mkdirs() }
+        val rootLink = File(parent, "checkout")
+        val target = File(root, "README.md").apply { writeText("# project notes") }
+        val outside = File(parent, "id_rsa").apply { writeText("PRIVATE KEY") }
+        try {
+            createPreviewSymlink(rootLink, root)
+            assertEquals(PreviewLinkRoute.LocalFile(target.toPath().toRealPath().toString()),
+                previewLinkRoute(File(rootLink, "README.md").toURI().toString(), rootLink.path))
+            assertEquals(PreviewLinkRoute.Refuse, previewLinkRoute(outside.toURI().toString(), rootLink.path))
+        } finally {
+            listOf(rootLink, target, outside, root, parent).forEach { it.delete() }
+        }
+    }
+
+    @Test
+    fun `a symlinked parent directory cannot expose an outside file`() {
+        val parent = Files.createTempDirectory("boss-preview-parent-link").toFile()
+        val root = File(parent, "project").apply { mkdirs() }
+        val outside = File(parent, "private").apply { mkdirs() }
+        val secret = File(outside, "id_rsa").apply { writeText("PRIVATE KEY") }
+        val link = File(root, "docs")
+        try {
+            createPreviewSymlink(link, outside)
+            assertEquals(PreviewLinkRoute.Refuse,
+                previewLinkRoute(File(link, "id_rsa").toURI().toString(), root.path))
+        } finally {
+            listOf(link, secret, outside, root, parent).forEach { it.delete() }
+        }
+    }
+
+    /** Skip only a demonstrated inability to create the link, never a routing failure. */
+    private fun createPreviewSymlink(link: File, target: File) {
+        try {
+            Files.createSymbolicLink(link.toPath(), target.toPath())
         } catch (failure: UnsupportedOperationException) {
             org.junit.Assume.assumeNoException("Symlinks are unsupported by this filesystem", failure)
         } catch (failure: java.nio.file.FileSystemException) {
@@ -444,8 +500,6 @@ class MarkdownPreviewShellTest {
             } else {
                 throw failure
             }
-        } finally {
-            listOf(link, outside, root, parent).forEach { it.delete() }
         }
     }
 
