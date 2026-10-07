@@ -31,7 +31,8 @@ group = "ai.rever.boss.plugin.dynamic"
 // (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.13).
 // 1.6.6: auto-bumped bundled BossEditor to 1.0.26
 // (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.26).
-version = "1.6.8"
+// 1.6.9: Compose-only minimap/font boundary supports BOSS 9.5.25.
+version = "1.6.10"
 
 java {
     toolchain {
@@ -56,6 +57,13 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
 }
 
+// Temporary source overrides for BossEditor 1.0.26 keep rendering behind the
+// shared Compose API on BOSS 9.5.25. Remove them after upgrading to a fixed release.
+val bossEditorVersion = "1.0.26"
+check(bossEditorVersion == "1.0.26") {
+    "Review the minimap/font compatibility overrides before upgrading BossEditor"
+}
+
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
@@ -70,7 +78,7 @@ dependencies {
     // BossEditor is private to this plugin (bundled into the plugin JAR by
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.26")
+    implementation("com.risaboss:bosseditor-compose-desktop:$bossEditorVersion")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,
@@ -122,6 +130,7 @@ dependencies {
     // Test-only scope: it stays out of runtimeClasspath, which is what
     // buildPluginJar bundles from.
     testImplementation(compose.ui)
+    testImplementation(compose.desktop.currentOs)
     // Reflection, for the test that compares PluginEditorSettingsData against
     // bosseditor's EditorSettings property by property. kotlin-reflect is compileOnly
     // for main (the host ships it), so the test classpath needs its own copy.
@@ -198,7 +207,19 @@ tasks.register<Jar>("buildPluginJar") {
                 p.contains("/org.jetbrains.compose.material3/") ||
                 // Feather icon pack used by the editor UI (not host-shared)
                 p.contains("/br.com.devsrsouza")
-        }.map { zipTree(it) }
+        }.map { jar ->
+            zipTree(jar).matching {
+                if (jar.path.replace('\\', '/').contains("/com.risaboss/bosseditor-compose-desktop/")) {
+                    // Source overrides include Kotlin-generated companion/lambda classes.
+                    exclude("ai/rever/bosseditor/features/MinimapRenderer*.class")
+                    exclude("ai/rever/bosseditor/features/MinimapCanvas*.class")
+                    exclude("ai/rever/bosseditor/features/MinimapState*.class")
+                    exclude("ai/rever/bosseditor/features/MinimapEditorState*.class")
+                    exclude("ai/rever/bosseditor/features/BasicMinimapEditorState*.class")
+                    exclude("ai/rever/bosseditor/settings/FontUtilsKt*.class")
+                }
+            }
+        }
     })
 }
 
@@ -220,6 +241,11 @@ tasks.processResources {
 // destination explicitly rather than letting it resolve a relative path against
 // the test JVM's working directory.
 tasks.test {
+    dependsOn("buildPluginJar")
+    val pluginJar = tasks.named<Jar>("buildPluginJar").flatMap { it.archiveFile }
+    jvmArgumentProviders.add(CommandLineArgumentProvider {
+        listOf("-Deditor.plugin.jar=${pluginJar.get().asFile.absolutePath}")
+    })
     systemProperty(
         "preview.fixture.dir",
         layout.buildDirectory.dir("preview-fixture").get().asFile.absolutePath
